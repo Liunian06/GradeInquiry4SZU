@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         深圳大学平时成绩&期末成绩查询
 // @namespace    http://tampermonkey.net/
-// @version      4.0
-// @description  双向固定分区遍历，更快查询速度，优化UI显示，支持导出Excel
+// @version      4.6
+// @description  10线程并行分段查询，自动推算系数（支持0:100），优化UI显示，支持导出Excel
 // @author       流年.
-// @match        https://ehall.szu.edu.cn/jwapp/sys/cjcx/*
-// @match        https://ehall-443.webvpn.szu.edu.cn/jwapp/sys/cjcx/*
+// @match        https://ehall.szu.edu.cn/*
+// @match        https://ehall-443.webvpn.szu.edu.cn/*
+// @connect      ehall.szu.edu.cn
+// @connect      ehall-443.webvpn.szu.edu.cn
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
@@ -24,7 +26,8 @@
         studentName: null,
         devMode: false,
         rawData: {
-            initialCourses: null
+            initialCourses: null,
+            queryResults: []  // 存储轮询结果
         }
     };
 
@@ -326,6 +329,74 @@
         #dev-raw-data.visible {
             display: block;
         }
+        .dev-query-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .dev-query-item {
+            margin-bottom: 8px;
+            border: 1px solid #424242;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .dev-query-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 10px;
+            background: #37474f;
+            color: #fff;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+        .dev-query-header:hover {
+            background: #455a64;
+        }
+        .dev-query-badge {
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        .dev-query-badge.pscj {
+            background: #4CAF50;
+        }
+        .dev-query-badge.qmcj {
+            background: #FF5722;
+        }
+        .dev-query-badge.count {
+            background: #2196F3;
+            margin-left: 6px;
+        }
+        .dev-query-body {
+            display: none;
+            background: #263238;
+            color: #80cbc4;
+            padding: 8px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.7rem;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        .dev-query-body.expanded {
+            display: block;
+        }
+        .dev-clear-btn {
+            margin-top: 6px;
+            padding: 4px 10px;
+            background: #f44336;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .dev-clear-btn:hover {
+            background: #d32f2f;
+        }
         .dev-data-section {
             margin-bottom: 12px;
         }
@@ -424,6 +495,14 @@
                         <div class="dev-data-content" id="dev-initial-data">暂无数据</div>
                         <button class="dev-copy-btn" data-target="dev-initial-data">复制到剪贴板</button>
                     </details>
+                    <details class="dev-data-section">
+                        <summary>🔄 轮询查询结果 (<span id="dev-query-count">0</span>条)</summary>
+                        <div class="dev-query-list" id="dev-query-list">
+                            <div style="padding:12px;color:#999;text-align:center;">暂无查询记录</div>
+                        </div>
+                        <button class="dev-copy-btn" id="dev-copy-all-queries">复制全部查询结果</button>
+                        <button class="dev-clear-btn" id="dev-clear-queries">清空记录</button>
+                    </details>
                 </div>
             </div>
 
@@ -484,6 +563,30 @@
             });
         });
 
+        // 复制全部查询结果按钮
+        container.querySelector('#dev-copy-all-queries').addEventListener('click', () => {
+            const text = JSON.stringify(scriptState.rawData.queryResults, null, 2);
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = container.querySelector('#dev-copy-all-queries');
+                const originalText = btn.textContent;
+                btn.textContent = '已复制!';
+                btn.style.background = '#4CAF50';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.background = '';
+                }, 1500);
+            }).catch(err => {
+                console.error('复制失败:', err);
+                alert('复制失败，请手动复制');
+            });
+        });
+
+        // 清空查询记录按钮
+        container.querySelector('#dev-clear-queries').addEventListener('click', () => {
+            scriptState.rawData.queryResults = [];
+            updateDevQueryDisplay();
+        });
+
         startBtn.addEventListener('click', async () => {
             if (scriptState.isRunning) return;
 
@@ -515,24 +618,26 @@
                 
                 initialCourses.forEach(course => {
                     const key = course.KCM + course.XNXQDM_DISPLAY;
-                    const pscjxs = parseFloat(course.PSCJXS) || 0;
-                    const qmcjxs = parseFloat(course.QMCJXS) || 0;
                     
-                    // 根据系数判断是否需要查询
-                    // 如果平时成绩系数为0或null，则不需要查询平时成绩
-                    // 如果期末成绩系数为0或null，则不需要查询期末成绩
-                    const needPscj = pscjxs > 0;
-                    const needQmcj = qmcjxs > 0;
+                    // 接口已不返回系数，需要查询两个成绩后自动计算
+                    // 初始化时设置为需要查询
+                    course.PSCJ = 'N/A';
+                    course.QMCJ = 'N/A';
+                    course.PSCJXS = '?';  // '?' 表示待计算
+                    course.QMCJXS = '?';
                     
-                    course.PSCJ = needPscj ? 'N/A' : '-';  // '-' 表示不需要查询
-                    course.QMCJ = needQmcj ? 'N/A' : '-';
-                    course.PSCJXS = course.PSCJXS || '0';
-                    course.QMCJXS = course.QMCJXS || '0';
-                    course._needPscj = needPscj;  // 内部标记
-                    course._needQmcj = needQmcj;
+                    // 内部使用的数值系数（初始为null，待推算）
+                    course._pscjxsNum = null;
+                    course._qmcjxsNum = null;
+                    course._needPscj = true;
+                    course._needQmcj = true;
+                    course._coefficientsInferred = false;
                     
-                    if (needPscj) needPscjCount++;
-                    if (needQmcj) needQmcjCount++;
+                    // 保存原始总成绩用于后续推算系数
+                    course._originalZCJ = course.ZCJ;
+                    
+                    needPscjCount++;
+                    needQmcjCount++;
                     
                     courseMap.set(key, course);
                 });
@@ -542,89 +647,207 @@
                 let pscjFoundCount = 0;
                 let qmcjFoundCount = 0;
                 
-                statusEl.textContent = '正在快速查询详细成绩...';
+                statusEl.textContent = '正在查询详细成绩...';
 
-                // 3. 双向固定分区遍历（无需判断交叉，更高效）
-                // 高分端: 100→51 (共50个分数)
-                // 低分端: 0→50 (共51个分数)
-                let highScore = 100;
-                let lowScore = 0;
-                const HIGH_END = 51;  // 高分端终点（含）
-                const LOW_END = 50;   // 低分端终点（含）
+                // 3. 十线程并行分段查询策略
+                // 10个线程分别处理10个分数段，每个线程处理约10个分数
+                const scoreRanges = [
+                    { start: 100, end: 91, label: '分段91-100' },
+                    { start: 90, end: 81, label: '分段81-90' },
+                    { start: 80, end: 71, label: '分段71-80' },
+                    { start: 70, end: 61, label: '分段61-70' },
+                    { start: 60, end: 51, label: '分段51-60' },
+                    { start: 50, end: 41, label: '分段41-50' },
+                    { start: 40, end: 31, label: '分段31-40' },
+                    { start: 30, end: 21, label: '分段21-30' },
+                    { start: 20, end: 11, label: '分段11-20' },
+                    { start: 10, end: 0, label: '分段0-10' }
+                ];
                 
-                while (highScore >= HIGH_END || lowScore <= LOW_END) {
-                    // 检查是否所有需要查询的成绩都已找到
-                    const pscjDone = pscjFoundCount >= needPscjCount;
-                    const qmcjDone = qmcjFoundCount >= needQmcjCount;
-                    
-                    if (pscjDone && qmcjDone) {
-                        console.log('[深大成绩查询] 所有成绩已找到，提前结束');
-                        break;
-                    }
-
-                    // 计算进度
-                    const highProgress = 100 - highScore;  // 高分端已完成数 (0→49)
-                    const lowProgress = lowScore;          // 低分端已完成数 (0→50)
-                    const progress = Math.min(((highProgress + lowProgress) / 101) * 100, 100);
+                // 共享状态（用于跟踪进度和提前终止）
+                const sharedState = {
+                    pscjFoundCount: 0,
+                    qmcjFoundCount: 0,
+                    queriedScores: new Set(),
+                    allDone: false
+                };
+                
+                // 更新进度显示
+                const updateProgress = () => {
+                    const totalScores = 101;
+                    const progress = Math.min((sharedState.queriedScores.size / totalScores) * 100, 100);
                     progressEl.style.width = `${progress}%`;
-                    statusEl.textContent = `查询进度: ${Math.round(progress)}% (↓${highScore} ↑${lowScore}) [平时:${pscjFoundCount}/${needPscjCount} 期末:${qmcjFoundCount}/${needQmcjCount}]`;
-
-                    // 并行查询：高分端和低分端同时进行
-                    const queries = [];
-                    
-                    // 高分端查询 (100→51)
-                    if (highScore >= HIGH_END) {
-                        if (!pscjDone) {
-                            queries.push(performQuery(highScore, 'PSCJ').then(rows => ({ type: 'PSCJ', score: highScore, rows })));
-                        }
-                        if (!qmcjDone) {
-                            queries.push(performQuery(highScore, 'QMCJ').then(rows => ({ type: 'QMCJ', score: highScore, rows })));
-                        }
+                    statusEl.textContent = `并行查询中... [平时:${sharedState.pscjFoundCount}/${needPscjCount} 期末:${sharedState.qmcjFoundCount}/${needQmcjCount}] (已查${sharedState.queriedScores.size}个分数)`;
+                };
+                
+                // 检查是否所有成绩都已找到
+                const checkAllDone = () => {
+                    if (sharedState.pscjFoundCount >= needPscjCount && sharedState.qmcjFoundCount >= needQmcjCount) {
+                        sharedState.allDone = true;
+                        return true;
+                    }
+                    return false;
+                };
+                
+                // 尝试推算课程系数的函数（支持0:100情况）
+                const tryInferCourseCoefficients = (course, scoreType, score) => {
+                    if (course._coefficientsInferred) {
+                        return; // 已经推算过
                     }
                     
-                    // 低分端查询 (0→50)
-                    if (lowScore <= LOW_END) {
-                        if (!pscjDone) {
-                            queries.push(performQuery(lowScore, 'PSCJ').then(rows => ({ type: 'PSCJ', score: lowScore, rows })));
-                        }
-                        if (!qmcjDone) {
-                            queries.push(performQuery(lowScore, 'QMCJ').then(rows => ({ type: 'QMCJ', score: lowScore, rows })));
-                        }
+                    const zcj = course._originalZCJ;
+                    if (zcj == null) {
+                        return;
                     }
-
-                    // 等待所有并行查询完成
-                    const results = await Promise.all(queries);
-
-                    // 处理查询结果
-                    results.forEach(result => {
-                        result.rows.forEach(row => {
-                            const key = row.KCM + row.XNXQDM_DISPLAY;
-                            const course = courseMap.get(key);
-                            if (course) {
-                                if (result.type === 'PSCJ' && course.PSCJ === 'N/A' && course._needPscj) {
-                                    course.PSCJ = result.score.toString();
-                                    course.PSCJXS = row.PSCJXS || course.PSCJXS;
-                                    pscjFoundCount++;
-                                } else if (result.type === 'QMCJ' && course.QMCJ === 'N/A' && course._needQmcj) {
-                                    course.QMCJ = result.score.toString();
-                                    course.QMCJXS = row.QMCJXS || course.QMCJXS;
-                                    qmcjFoundCount++;
-                                }
+                    
+                    // 快速检查：如果当前成绩等于总成绩，则为100:0或0:100
+                    if (score === zcj) {
+                        if (scoreType === 'PSCJ') {
+                            // 平时成绩=总成绩，说明是100%平时成绩
+                            course._pscjxsNum = 100;
+                            course._qmcjxsNum = 0;
+                            course.PSCJXS = '100*';
+                            course.QMCJXS = '0*';
+                            course.QMCJ = '-';  // 不需要期末成绩
+                            course._needQmcj = false;
+                            course._coefficientsInferred = true;
+                            // 减少需要查询的期末成绩计数
+                            if (sharedState.qmcjFoundCount < needQmcjCount) {
+                                sharedState.qmcjFoundCount++;
                             }
-                        });
-                    });
-
-                    // 更新数据和渲染
-                    scriptState.courseData = Array.from(courseMap.values());
-                    renderResults();
-
-                    // 移动指针（独立移动，无需判断交叉）
-                    if (highScore >= HIGH_END) highScore--;
-                    if (lowScore <= LOW_END) lowScore++;
-
-                    // 更短的延迟，加快查询速度（30ms）
-                    await new Promise(resolve => setTimeout(resolve, 30));
-                }
+                            console.log(`[系数推算] ${course.KCM}: 100%平时成绩 (平时=${score}=总成绩=${zcj})`);
+                            renderResults();
+                            return;
+                        } else if (scoreType === 'QMCJ') {
+                            // 期末成绩=总成绩，说明是100%期末成绩
+                            course._pscjxsNum = 0;
+                            course._qmcjxsNum = 100;
+                            course.PSCJXS = '0*';
+                            course.QMCJXS = '100*';
+                            course.PSCJ = '-';  // 不需要平时成绩
+                            course._needPscj = false;
+                            course._coefficientsInferred = true;
+                            // 减少需要查询的平时成绩计数
+                            if (sharedState.pscjFoundCount < needPscjCount) {
+                                sharedState.pscjFoundCount++;
+                            }
+                            console.log(`[系数推算] ${course.KCM}: 100%期末成绩 (期末=${score}=总成绩=${zcj})`);
+                            renderResults();
+                            return;
+                        }
+                    }
+                    
+                    // 检查是否两个成绩都已查到
+                    const pscjStr = course.PSCJ;
+                    const qmcjStr = course.QMCJ;
+                    
+                    if (pscjStr === 'N/A' || pscjStr === '-' || qmcjStr === 'N/A' || qmcjStr === '-') {
+                        return; // 成绩未全部查到或不需要
+                    }
+                    
+                    const pscj = parseFloat(pscjStr);
+                    const qmcj = parseFloat(qmcjStr);
+                    
+                    if (isNaN(pscj) || isNaN(qmcj)) {
+                        console.log(`[系数推算] ${course.KCM}: 数据不完整，无法推算`);
+                        return;
+                    }
+                    
+                    // 异步推算系数
+                    setTimeout(() => {
+                        const inferred = inferCoefficients(pscj, qmcj, zcj);
+                        if (inferred) {
+                            course._pscjxsNum = inferred.pscjxs;
+                            course._qmcjxsNum = inferred.qmcjxs;
+                            course.PSCJXS = String(inferred.pscjxs) + '*';
+                            course.QMCJXS = String(inferred.qmcjxs) + '*';
+                            course._coefficientsInferred = true;
+                            console.log(`[系数推算] ${course.KCM}: 平时${inferred.pscjxs}% 期末${inferred.qmcjxs}%`);
+                            
+                            // 触发重新渲染
+                            renderResults();
+                        } else {
+                            console.log(`[系数推算] ${course.KCM}: 无法推算系数 (平时=${pscj}, 期末=${qmcj}, 总成绩=${zcj})`);
+                            course.PSCJXS = '?';
+                            course.QMCJXS = '?';
+                        }
+                    }, 0);
+                };
+                
+                // 单个分数段的查询任务
+                const queryRangeTask = async (range) => {
+                    console.log(`[深大成绩查询] 线程启动: ${range.label}`);
+                    
+                    for (let score = range.start; score >= range.end; score--) {
+                        // 检查是否已全部完成
+                        if (sharedState.allDone) {
+                            console.log(`[深大成绩查询] ${range.label} 提前结束（所有成绩已找到）`);
+                            break;
+                        }
+                        
+                        // 标记该分数已查询
+                        sharedState.queriedScores.add(score);
+                        
+                        // 查询平时成绩
+                        if (sharedState.pscjFoundCount < needPscjCount) {
+                            try {
+                                const pscjRows = await performQuery(score, 'PSCJ');
+                                pscjRows.forEach(row => {
+                                    const key = row.KCM + row.XNXQDM_DISPLAY;
+                                    const course = courseMap.get(key);
+                                    if (course && course.PSCJ === 'N/A' && course._needPscj) {
+                                        course.PSCJ = score.toString();
+                                        sharedState.pscjFoundCount++;
+                                        // 尝试推算系数（传入成绩类型和分数用于0:100判断）
+                                        tryInferCourseCoefficients(course, 'PSCJ', score);
+                                    }
+                                });
+                            } catch (e) {
+                                console.error(`[深大成绩查询] ${range.label} 查询PSCJ=${score}失败:`, e);
+                            }
+                        }
+                        
+                        // 查询期末成绩
+                        if (sharedState.qmcjFoundCount < needQmcjCount) {
+                            try {
+                                const qmcjRows = await performQuery(score, 'QMCJ');
+                                qmcjRows.forEach(row => {
+                                    const key = row.KCM + row.XNXQDM_DISPLAY;
+                                    const course = courseMap.get(key);
+                                    if (course && course.QMCJ === 'N/A' && course._needQmcj) {
+                                        course.QMCJ = score.toString();
+                                        sharedState.qmcjFoundCount++;
+                                        // 尝试推算系数（传入成绩类型和分数用于0:100判断）
+                                        tryInferCourseCoefficients(course, 'QMCJ', score);
+                                    }
+                                });
+                            } catch (e) {
+                                console.error(`[深大成绩查询] ${range.label} 查询QMCJ=${score}失败:`, e);
+                            }
+                        }
+                        
+                        // 更新数据和渲染
+                        scriptState.courseData = Array.from(courseMap.values());
+                        renderResults();
+                        updateProgress();
+                        
+                        // 检查是否完成
+                        checkAllDone();
+                        
+                        // 短暂延迟，避免请求过于密集
+                        await new Promise(resolve => setTimeout(resolve, 30));
+                    }
+                    
+                    console.log(`[深大成绩查询] ${range.label} 线程完成`);
+                };
+                
+                // 启动10个并行线程
+                console.log('[深大成绩查询] 启动10线程并行查询...');
+                await Promise.all(scoreRanges.map(range => queryRangeTask(range)));
+                
+                // 更新最终计数
+                pscjFoundCount = sharedState.pscjFoundCount;
+                qmcjFoundCount = sharedState.qmcjFoundCount;
 
                 progressEl.style.width = '100%';
                 statusEl.textContent = `查询完成！共 ${courseMap.size} 门课程`;
@@ -647,16 +870,24 @@
                 return;
             }
 
-            // 准备表头（与前端展示的数据一致）
+            // 准备表头（与前端展示的数据一致，增加系数来源列）
             const header = [
                 '学期', '课程号', '课程名称', '课程类别', '开课学院', '课程学分',
                 '平时成绩', '平时系数(%)', '期末成绩', '期末系数(%)',
-                '总成绩', '等级', '等级制成绩'
+                '总成绩', '等级', '等级制成绩', '系数来源'
             ];
 
             // 准备数据行
             const dataRows = scriptState.courseData.map(course => {
                 const { finalScore, grade } = calculateFinalScoreAndGrade(course);
+                // 判断系数来源
+                let coefficientSource = '未知';
+                if (course._coefficientsInferred) {
+                    coefficientSource = '推算';
+                } else if (course.PSCJXS && !course.PSCJXS.endsWith('*') && course.PSCJXS !== '?') {
+                    coefficientSource = '接口返回';
+                }
+                
                 return [
                     course.XNXQDM_DISPLAY || 'N/A',
                     course.KCH || 'N/A',
@@ -665,12 +896,13 @@
                     course.KKDWDM_DISPLAY || 'N/A',
                     course.XF || 'N/A',
                     course.PSCJ,
-                    course.PSCJXS || 'N/A',
+                    course.PSCJXS ? course.PSCJXS.replace('*', '') : 'N/A',
                     course.QMCJ,
-                    course.QMCJXS || 'N/A',
+                    course.QMCJXS ? course.QMCJXS.replace('*', '') : 'N/A',
                     finalScore,
                     grade,
-                    course.XFJD || 'N/A'
+                    course.XFJD || 'N/A',
+                    coefficientSource
                 ];
             });
 
@@ -694,7 +926,8 @@
                 { wch: 12 },    // 期末系数
                 { wch: 10 },    // 总成绩
                 { wch: 8 },     // 等级
-                { wch: 12 }     // 等级制成绩
+                { wch: 12 },    // 等级制成绩
+                { wch: 10 }     // 系数来源
             ];
 
             // 创建工作簿
@@ -713,48 +946,94 @@
     }
 
     function calculateFinalScoreAndGrade(course) {
-        const pscjxs = parseFloat(course.PSCJXS) || 0;
-        const qmcjxs = parseFloat(course.QMCJXS) || 0;
+        // 使用内部存储的数值系数，处理系数未知的情况
+        const pscjxs = course._pscjxsNum;
+        const qmcjxs = course._qmcjxsNum;
         
-        // 解析成绩，'-' 表示不需要该成绩，视为0分0权重
-        const pscj = course.PSCJ === '-' ? 0 : parseFloat(course.PSCJ);
-        const qmcj = course.QMCJ === '-' ? 0 : parseFloat(course.QMCJ);
+        // 判断系数是否已知
+        const pscjxsKnown = pscjxs !== null && pscjxs !== undefined;
+        const qmcjxsKnown = qmcjxs !== null && qmcjxs !== undefined;
         
-        // 计算有效权重
-        const effectivePscjxs = course.PSCJ === '-' ? 0 : pscjxs;
-        const effectiveQmcjxs = course.QMCJ === '-' ? 0 : qmcjxs;
+        // 解析成绩，'-' 表示不需要该成绩
+        const pscjStr = course.PSCJ;
+        const qmcjStr = course.QMCJ;
+        const pscj = pscjStr === '-' ? null : parseFloat(pscjStr);
+        const qmcj = qmcjStr === '-' ? null : parseFloat(qmcjStr);
+        
+        // 检查成绩是否已获取
+        const hasPscj = pscjStr !== '-' && pscjStr !== 'N/A' && !isNaN(pscj);
+        const hasQmcj = qmcjStr !== '-' && qmcjStr !== 'N/A' && !isNaN(qmcj);
 
         let rawFinalScore;
 
-        // 如果只有平时成绩（系数100%或期末系数为0）
-        if (effectivePscjxs === 100 || (effectivePscjxs > 0 && effectiveQmcjxs === 0)) {
-            if (!isNaN(pscj) && course.PSCJ !== 'N/A') {
+        // 情况1：系数都未知，无法计算，使用服务器返回的总成绩
+        if (!pscjxsKnown && !qmcjxsKnown) {
+            if (course.ZCJ != null) {
+                return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
+            }
+            // 如果两个成绩都已获取，尝试简单平均（仅作为备选）
+            if (hasPscj && hasQmcj) {
+                rawFinalScore = (pscj + qmcj) / 2;
+            } else {
+                return { finalScore: 'N/A', grade: 'N/A' };
+            }
+        }
+        // 情况2：只有平时成绩系数有效（期末系数为0或未知）
+        else if (pscjxsKnown && pscjxs === 100) {
+            if (hasPscj) {
                 rawFinalScore = pscj;
             } else {
-                // 还没查到平时成绩
                 if (course.ZCJ != null) {
                     return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
                 }
                 return { finalScore: 'N/A', grade: 'N/A' };
             }
         }
-        // 如果只有期末成绩（期末系数100%或平时系数为0）
-        else if (effectiveQmcjxs === 100 || (effectiveQmcjxs > 0 && effectivePscjxs === 0)) {
-            if (!isNaN(qmcj) && course.QMCJ !== 'N/A') {
+        else if (pscjxsKnown && pscjxs > 0 && qmcjxsKnown && qmcjxs === 0) {
+            if (hasPscj) {
+                rawFinalScore = pscj;
+            } else {
+                if (course.ZCJ != null) {
+                    return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
+                }
+                return { finalScore: 'N/A', grade: 'N/A' };
+            }
+        }
+        // 情况3：只有期末成绩系数有效（平时系数为0或未知）
+        else if (qmcjxsKnown && qmcjxs === 100) {
+            if (hasQmcj) {
                 rawFinalScore = qmcj;
             } else {
-                // 还没查到期末成绩
                 if (course.ZCJ != null) {
                     return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
                 }
                 return { finalScore: 'N/A', grade: 'N/A' };
             }
         }
-        // 正常情况：平时+期末
-        else if (!isNaN(pscj) && !isNaN(qmcj) && course.PSCJ !== 'N/A' && course.QMCJ !== 'N/A') {
-            rawFinalScore = (pscj * pscjxs / 100) + (qmcj * qmcjxs / 100);
-        } else {
-            // 成绩不完整，使用服务器返回的总成绩
+        else if (qmcjxsKnown && qmcjxs > 0 && pscjxsKnown && pscjxs === 0) {
+            if (hasQmcj) {
+                rawFinalScore = qmcj;
+            } else {
+                if (course.ZCJ != null) {
+                    return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
+                }
+                return { finalScore: 'N/A', grade: 'N/A' };
+            }
+        }
+        // 情况4：正常情况，两个系数都有效且都 > 0
+        else if (pscjxsKnown && qmcjxsKnown && pscjxs > 0 && qmcjxs > 0) {
+            if (hasPscj && hasQmcj) {
+                rawFinalScore = (pscj * pscjxs / 100) + (qmcj * qmcjxs / 100);
+            } else {
+                // 成绩不完整，使用服务器返回的总成绩
+                if (course.ZCJ != null) {
+                    return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
+                }
+                return { finalScore: 'N/A', grade: 'N/A' };
+            }
+        }
+        // 其他情况：使用服务器返回的总成绩
+        else {
             if (course.ZCJ != null) {
                 return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
             }
@@ -975,8 +1254,8 @@
                     </div>
                     
                     <div class="course-detail full-width score-row">
-                        <span>平时: <b style="color: #4CAF50;">${course.PSCJ}</b> (${course.PSCJXS}%)</span>
-                        <span>期末: <b style="color: #FF5722;">${course.QMCJ}</b> (${course.QMCJXS}%)</span>
+                        <span>平时: <b style="color: #4CAF50;">${course.PSCJ}</b> (${formatCoefficient(course.PSCJXS)})</span>
+                        <span>期末: <b style="color: #FF5722;">${course.QMCJ}</b> (${formatCoefficient(course.QMCJXS)})</span>
                     </div>
                     
                     <div class="course-detail full-width score-row" style="margin-top: 4px; padding-top: 4px; border-top: 1px solid #eee;">
@@ -988,6 +1267,16 @@
         });
     }
 
+    // 格式化系数显示
+    function formatCoefficient(xs) {
+        if (xs === '?') return '?';
+        if (xs.endsWith('*')) {
+            // 推断值，显示带提示
+            return xs.replace('*', '') + '% (推断)';
+        }
+        return xs + '%';
+    }
+
     // 更新开发者模式数据显示
     function updateDevDataDisplay() {
         if (!scriptState.container) return;
@@ -997,28 +1286,178 @@
         if (initialDataEl && scriptState.rawData.initialCourses !== null) {
             initialDataEl.textContent = JSON.stringify(scriptState.rawData.initialCourses, null, 2);
         }
+        
+        updateDevQueryDisplay();
+    }
+
+    // 更新轮询查询结果显示
+    function updateDevQueryDisplay() {
+        if (!scriptState.container) return;
+        
+        const queryListEl = scriptState.container.querySelector('#dev-query-list');
+        const queryCountEl = scriptState.container.querySelector('#dev-query-count');
+        
+        if (!queryListEl || !queryCountEl) return;
+        
+        const results = scriptState.rawData.queryResults;
+        queryCountEl.textContent = results.length;
+        
+        if (results.length === 0) {
+            queryListEl.innerHTML = '<div style="padding:12px;color:#999;text-align:center;">暂无查询记录</div>';
+            return;
+        }
+        
+        // 只显示最近的100条记录，避免DOM过多
+        const displayResults = results.slice(-100);
+        
+        queryListEl.innerHTML = displayResults.map((item, idx) => {
+            const realIdx = results.length - displayResults.length + idx;
+            const badgeClass = item.type === 'PSCJ' ? 'pscj' : 'qmcj';
+            const typeLabel = item.type === 'PSCJ' ? '平时' : '期末';
+            const rowCount = item.rows ? item.rows.length : 0;
+            
+            return `
+                <div class="dev-query-item">
+                    <div class="dev-query-header" onclick="this.nextElementSibling.classList.toggle('expanded')">
+                        <span>#${realIdx + 1} 查询 ${typeLabel}=${item.score}</span>
+                        <span>
+                            <span class="dev-query-badge ${badgeClass}">${typeLabel}</span>
+                            <span class="dev-query-badge count">${rowCount}条</span>
+                        </span>
+                    </div>
+                    <div class="dev-query-body">${JSON.stringify(item, null, 2)}</div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    // 添加单条查询结果到记录
+    function addQueryResult(score, type, rows, rawResponse) {
+        const result = {
+            timestamp: new Date().toISOString(),
+            score: score,
+            type: type,
+            rowCount: rows.length,
+            rows: rows,
+            rawResponse: rawResponse
+        };
+        
+        scriptState.rawData.queryResults.push(result);
+        
+        // 如果开发者模式开启，实时更新显示
+        if (scriptState.devMode) {
+            updateDevQueryDisplay();
+        }
     }
 
     toggleBtn.addEventListener('click', () => scriptState.container.classList.toggle('hidden'));
 
+    /**
+     * 根据平时成绩、期末成绩和总成绩推断系数
+     * @param {number} pscj 平时成绩
+     * @param {number} qmcj 期末成绩
+     * @param {number} zcj 总成绩
+     * @returns {object|null} 推断的系数 {pscjxs, qmcjxs} 或 null（无法推断）
+     */
+    function inferCoefficients(pscj, qmcj, zcj) {
+        // 常见的系数比例（平时:期末）
+        const commonRatios = [
+            { pscjxs: 10, qmcjxs: 90 },
+            { pscjxs: 20, qmcjxs: 80 },
+            { pscjxs: 30, qmcjxs: 70 },
+            { pscjxs: 40, qmcjxs: 60 },
+            { pscjxs: 50, qmcjxs: 50 },
+            { pscjxs: 60, qmcjxs: 40 },
+            { pscjxs: 70, qmcjxs: 30 },
+            { pscjxs: 80, qmcjxs: 20 },
+            { pscjxs: 90, qmcjxs: 10 },
+            { pscjxs: 100, qmcjxs: 0 },
+            { pscjxs: 0, qmcjxs: 100 }
+        ];
+        
+        // 计算加权平均并四舍五入
+        function calculateWeightedScore(p, q, pxs, qxs) {
+            return Math.round((p * pxs / 100) + (q * qxs / 100));
+        }
+        
+        // 1. 首先尝试常见比例
+        for (const ratio of commonRatios) {
+            const calculated = calculateWeightedScore(pscj, qmcj, ratio.pscjxs, ratio.qmcjxs);
+            if (calculated === zcj) {
+                console.log(`[系数推断] 匹配常见比例 ${ratio.pscjxs}:${ratio.qmcjxs}, 计算=${calculated}, 总成绩=${zcj}`);
+                return ratio;
+            }
+        }
+        
+        // 2. 如果常见比例都不匹配，逐个尝试从1到99的平时成绩系数
+        for (let pxs = 1; pxs <= 99; pxs++) {
+            const qxs = 100 - pxs;
+            const calculated = calculateWeightedScore(pscj, qmcj, pxs, qxs);
+            if (calculated === zcj) {
+                console.log(`[系数推断] 匹配比例 ${pxs}:${qxs}, 计算=${calculated}, 总成绩=${zcj}`);
+                return { pscjxs: pxs, qmcjxs: qxs };
+            }
+        }
+        
+        // 3. 检查是否只有一种成绩（100%比例的情况）
+        if (Math.round(pscj) === zcj) {
+            console.log(`[系数推断] 可能是100%平时成绩`);
+            return { pscjxs: 100, qmcjxs: 0 };
+        }
+        if (Math.round(qmcj) === zcj) {
+            console.log(`[系数推断] 可能是100%期末成绩`);
+            return { pscjxs: 0, qmcjxs: 100 };
+        }
+        
+        // 无法推断
+        console.log(`[系数推断] 无法推断系数: 平时=${pscj}, 期末=${qmcj}, 总成绩=${zcj}`);
+        return null;
+    }
+
     // 获取初始课程列表
     function fetchInitialCourseList() {
         return new Promise((resolve, reject) => {
+            const url = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/xscjcx.do`;
+            console.log('[深大成绩查询] 正在获取初始课程列表:', url);
+            
             GM_xmlhttpRequest({
-                method: "GET",
-                url: `${location.origin}/jwapp/sys/cjcx/modules/cjcx/xscjcx.do`,
-                headers: { "Cookie": document.cookie },
+                method: "POST",
+                url: url,
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest"
+                },
+                data: "pageSize=100&pageNumber=1",
+                timeout: 30000,
                 onload: res => {
+                    console.log('[深大成绩查询] 初始课程列表响应状态:', res.status);
                     try {
+                        if (res.status !== 200) {
+                            console.error('[深大成绩查询] 请求返回非200状态:', res.status, res.responseText);
+                            reject(new Error(`请求失败，状态码: ${res.status}`));
+                            return;
+                        }
                         const data = JSON.parse(res.responseText);
+                        console.log('[深大成绩查询] 解析成功，课程数量:', data?.datas?.xscjcx?.rows?.length || 0);
                         scriptState.rawData.initialCourses = data;
                         if (scriptState.devMode) {
                             updateDevDataDisplay();
                         }
                         resolve(data?.datas?.xscjcx?.rows || []);
-                    } catch (e) { reject(new Error("解析初始课程列表失败")); }
+                    } catch (e) {
+                        console.error('[深大成绩查询] 解析初始课程列表失败:', e, res.responseText?.substring(0, 500));
+                        reject(new Error("解析初始课程列表失败: " + e.message));
+                    }
                 },
-                onerror: () => reject(new Error("获取初始课程列表网络请求失败"))
+                onerror: (err) => {
+                    console.error('[深大成绩查询] 获取初始课程列表网络错误:', err);
+                    reject(new Error("获取初始课程列表网络请求失败"));
+                },
+                ontimeout: () => {
+                    console.error('[深大成绩查询] 获取初始课程列表超时');
+                    reject(new Error("获取初始课程列表请求超时"));
+                }
             });
         });
     }
@@ -1027,25 +1466,59 @@
     function performQuery(score, scoreType) {
         return new Promise(resolve => {
             const payload = `querySetting=[{"name":"${scoreType}","value":"${score}","linkOpt":"and","builder":"equal"}]&pageSize=100&pageNumber=1`;
+            const url = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/xscjcx.do`;
+            
             GM_xmlhttpRequest({
                 method: "POST",
-                url: `${location.origin}/jwapp/sys/cjcx/modules/cjcx/xscjcx.do`,
+                url: url,
                 headers: {
                     "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                    "Cookie": document.cookie
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest"
                 },
                 data: payload,
+                timeout: 15000,
                 onload: res => {
                     try {
+                        if (res.status !== 200) {
+                            console.error(`[深大成绩查询] 查询${scoreType}=${score}返回非200:`, res.status);
+                            if (scriptState.devMode) {
+                                addQueryResult(score, scoreType, [], { error: `HTTP ${res.status}`, rawText: res.responseText });
+                            }
+                            resolve([]);
+                            return;
+                        }
                         const data = JSON.parse(res.responseText);
-                        resolve(data?.datas?.xscjcx?.rows || []);
+                        const rows = data?.datas?.xscjcx?.rows || [];
+                        
+                        // 开发者模式：记录查询结果
+                        if (scriptState.devMode) {
+                            addQueryResult(score, scoreType, rows, data);
+                        }
+                        
+                        resolve(rows);
                     } catch (e) {
                         console.error(`解析${scoreType}=${score}的响应失败:`, e);
+                        // 开发者模式：记录错误
+                        if (scriptState.devMode) {
+                            addQueryResult(score, scoreType, [], { error: e.message, rawText: res.responseText?.substring(0, 500) });
+                        }
                         resolve([]);
                     }
                 },
-                onerror: () => {
-                    console.error(`查询${scoreType}=${score}时网络请求失败`);
+                onerror: (err) => {
+                    console.error(`查询${scoreType}=${score}时网络请求失败:`, err);
+                    // 开发者模式：记录网络错误
+                    if (scriptState.devMode) {
+                        addQueryResult(score, scoreType, [], { networkError: true, error: String(err) });
+                    }
+                    resolve([]);
+                },
+                ontimeout: () => {
+                    console.error(`查询${scoreType}=${score}超时`);
+                    if (scriptState.devMode) {
+                        addQueryResult(score, scoreType, [], { timeout: true });
+                    }
                     resolve([]);
                 }
             });
