@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         深圳大学平时成绩&期末成绩查询
 // @namespace    http://tampermonkey.net/
-// @version      4.6
-// @description  10线程并行分段查询，自动推算系数（支持0:100），优化UI显示，支持导出Excel
+// @version      4.7
+// @description  修复成绩系数接口
 // @author       流年.
-// @match        https://ehall.szu.edu.cn/*
-// @match        https://ehall-443.webvpn.szu.edu.cn/*
+// @match        https://ehall.szu.edu.cn/jwapp/sys/cjcx/*
+// @match        https://ehall-443.webvpn.szu.edu.cn/jwapp/sys/cjcx/*
 // @connect      ehall.szu.edu.cn
 // @connect      ehall-443.webvpn.szu.edu.cn
 // @grant        GM_xmlhttpRequest
@@ -611,7 +611,27 @@
                     return;
                 }
 
-                // 2. 初始化课程Map，并根据系数判断需要查询哪些成绩
+                // 2. 优先获取课程系数（新增逻辑）
+                statusEl.textContent = `正在获取课程系数 (0/${initialCourses.length})...`;
+                const coefficientMap = new Map();
+                
+                // 分批并发获取系数
+                const batchSize = 5;
+                for (let i = 0; i < initialCourses.length; i += batchSize) {
+                    const batch = initialCourses.slice(i, i + batchSize);
+                    await Promise.all(batch.map(async (course) => {
+                        if (course.JXBID) {
+                            const coeffs = await fetchCourseCoefficients(course.JXBID);
+                            if (coeffs) {
+                                coefficientMap.set(course.JXBID, coeffs);
+                            }
+                        }
+                    }));
+                    statusEl.textContent = `正在获取课程系数 (${Math.min(i + batchSize, initialCourses.length)}/${initialCourses.length})...`;
+                    await new Promise(r => setTimeout(r, 50)); // 稍微延时防止请求过快
+                }
+
+                // 3. 初始化课程Map，并根据系数判断需要查询哪些成绩
                 const courseMap = new Map();
                 let needPscjCount = 0;  // 需要查询平时成绩的课程数
                 let needQmcjCount = 0;  // 需要查询期末成绩的课程数
@@ -619,25 +639,48 @@
                 initialCourses.forEach(course => {
                     const key = course.KCM + course.XNXQDM_DISPLAY;
                     
-                    // 接口已不返回系数，需要查询两个成绩后自动计算
-                    // 初始化时设置为需要查询
+                    // 初始化成绩
                     course.PSCJ = 'N/A';
                     course.QMCJ = 'N/A';
-                    course.PSCJXS = '?';  // '?' 表示待计算
-                    course.QMCJXS = '?';
                     
-                    // 内部使用的数值系数（初始为null，待推算）
-                    course._pscjxsNum = null;
-                    course._qmcjxsNum = null;
-                    course._needPscj = true;
-                    course._needQmcj = true;
-                    course._coefficientsInferred = false;
+                    // 检查是否获取到了官方系数
+                    const officialCoeffs = coefficientMap.get(course.JXBID);
+                    
+                    if (officialCoeffs) {
+                        // 使用官方系数
+                        course.PSCJXS = officialCoeffs.pscjxs;
+                        course.QMCJXS = officialCoeffs.qmcjxs;
+                        course._pscjxsNum = parseFloat(officialCoeffs.pscjxs);
+                        course._qmcjxsNum = parseFloat(officialCoeffs.qmcjxs);
+                        course._coefficientsSource = 'official'; // 标记来源
+                        course._coefficientsInferred = false;
+                        
+                        // 根据系数优化查询需求
+                        // 如果系数为0，则不需要查询对应成绩
+                        course._needPscj = course._pscjxsNum > 0;
+                        course._needQmcj = course._qmcjxsNum > 0;
+                        
+                        if (!course._needPscj) course.PSCJ = '-';
+                        if (!course._needQmcj) course.QMCJ = '-';
+                        
+                        console.log(`[系数获取] ${course.KCM}: 使用接口系数 平时${course.PSCJXS}% 期末${course.QMCJXS}%`);
+                    } else {
+                        // 未获取到系数，准备推算
+                        course.PSCJXS = '?';  // '?' 表示待计算
+                        course.QMCJXS = '?';
+                        course._pscjxsNum = null;
+                        course._qmcjxsNum = null;
+                        course._coefficientsSource = 'unknown';
+                        course._coefficientsInferred = false;
+                        course._needPscj = true;
+                        course._needQmcj = true;
+                    }
                     
                     // 保存原始总成绩用于后续推算系数
                     course._originalZCJ = course.ZCJ;
                     
-                    needPscjCount++;
-                    needQmcjCount++;
+                    if (course._needPscj) needPscjCount++;
+                    if (course._needQmcj) needQmcjCount++;
                     
                     courseMap.set(key, course);
                 });
@@ -691,8 +734,9 @@
                 
                 // 尝试推算课程系数的函数（支持0:100情况）
                 const tryInferCourseCoefficients = (course, scoreType, score) => {
-                    if (course._coefficientsInferred) {
-                        return; // 已经推算过
+                    // 如果已经是官方系数或已经推算过，则跳过
+                    if (course._coefficientsSource === 'official' || course._coefficientsInferred) {
+                        return;
                     }
                     
                     const zcj = course._originalZCJ;
@@ -882,10 +926,12 @@
                 const { finalScore, grade } = calculateFinalScoreAndGrade(course);
                 // 判断系数来源
                 let coefficientSource = '未知';
-                if (course._coefficientsInferred) {
+                if (course._coefficientsSource === 'official') {
+                    coefficientSource = '接口返回';
+                } else if (course._coefficientsInferred) {
                     coefficientSource = '推算';
                 } else if (course.PSCJXS && !course.PSCJXS.endsWith('*') && course.PSCJXS !== '?') {
-                    coefficientSource = '接口返回';
+                    coefficientSource = '接口返回(旧)';
                 }
                 
                 return [
@@ -1269,8 +1315,8 @@
 
     // 格式化系数显示
     function formatCoefficient(xs) {
-        if (xs === '?') return '?';
-        if (xs.endsWith('*')) {
+        if (!xs || xs === '?') return '?';
+        if (typeof xs === 'string' && xs.endsWith('*')) {
             // 推断值，显示带提示
             return xs.replace('*', '') + '% (推断)';
         }
@@ -1458,6 +1504,45 @@
                     console.error('[深大成绩查询] 获取初始课程列表超时');
                     reject(new Error("获取初始课程列表请求超时"));
                 }
+            });
+        });
+    }
+
+    // 获取单门课程的系数
+    function fetchCourseCoefficients(jxbid) {
+        return new Promise(resolve => {
+            const url = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/jxblrcjxs.do`;
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: url,
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest"
+                },
+                data: `JXBID=${jxbid}&XSYC=0`,
+                timeout: 5000, // 系数查询超时时间短一点
+                onload: res => {
+                    try {
+                        if (res.status === 200) {
+                            const data = JSON.parse(res.responseText);
+                            // 结构: datas.jxblrcjxs.rows[0]
+                            const row = data?.datas?.jxblrcjxs?.rows?.[0];
+                            if (row) {
+                                resolve({
+                                    pscjxs: row.PSCJXS,
+                                    qmcjxs: row.QMCJXS
+                                });
+                                return;
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`[深大成绩查询] 获取课程系数失败 JXBID=${jxbid}`, e);
+                    }
+                    resolve(null);
+                },
+                onerror: () => resolve(null),
+                ontimeout: () => resolve(null)
             });
         });
     }
