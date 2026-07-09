@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         深圳大学平时成绩&期末成绩查询
 // @namespace    http://tampermonkey.net/
-// @version      4.7
-// @description  修复成绩系数接口
+// @version      4.19
+// @description  开发者模式监听页面真实请求，支持页面内表格展示
 // @author       流年.
 // @match        https://ehall.szu.edu.cn/jwapp/sys/cjcx/*
 // @match        https://ehall-443.webvpn.szu.edu.cn/jwapp/sys/cjcx/*
@@ -11,6 +11,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // @license      MIT
 // ==/UserScript==
@@ -25,9 +26,35 @@
         studentId: null,
         studentName: null,
         devMode: false,
+        isProbing: false,
+        queryProgress: {
+            active: false,
+            percent: 0,
+            message: '准备就绪',
+            detail: '',
+            updatedAt: null
+        },
         rawData: {
             initialCourses: null,
-            queryResults: []  // 存储轮询结果
+            queryResults: [],  // 存储轮询结果
+            probeResults: null,
+            networkCaptures: []
+        },
+        networkMonitor: {
+            installed: false,
+            active: false,
+            originalFetch: null,
+            originalXHROpen: null,
+            originalXHRSend: null
+        },
+        inlineScoreTab: {
+            installed: false,
+            tab: null,
+            panel: null
+        },
+        tableSort: {
+            field: 'courseName',
+            direction: 'asc'
         }
     };
 
@@ -39,6 +66,7 @@
             top: 20px;
             right: 20px;
             width: 500px;
+            max-width: calc(100vw - 40px);
             background: #f9f9f9;
             border-radius: 16px;
             padding: 20px;
@@ -171,9 +199,299 @@
         /* Results Area */
         #score-results {
             max-height: 400px;
-            overflow-y: auto;
+            overflow: auto;
             margin: 0 -12px;
             padding: 4px 12px;
+        }
+        .score-summary-card {
+            background: #e3f2fd;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            border: 1px solid #bbdefb;
+        }
+        .score-summary-title {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #1565c0;
+            margin-bottom: 12px;
+        }
+        .score-summary-grid {
+            display: grid;
+            grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr);
+            gap: 14px;
+            align-items: stretch;
+            margin-bottom: 14px;
+        }
+        .score-summary-panel {
+            width: 100%;
+            height: 100%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            background: #fff;
+            border: 1px solid #d6e3ef;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .score-summary-panel-title {
+            padding: 9px 12px;
+            background: #f5fbff;
+            border-bottom: 1px solid #d6e3ef;
+            color: #455a64;
+            font-size: 0.86rem;
+            font-weight: 700;
+        }
+        .score-summary-table {
+            width: 100%;
+            flex: 1;
+            border-collapse: collapse;
+            table-layout: fixed;
+            background: #fff;
+            font-size: 0.84rem;
+        }
+        .score-summary-table th,
+        .score-summary-table td {
+            padding: 8px 12px;
+            border-top: 1px solid #eef3f7;
+            text-align: left;
+            line-height: 1.4;
+        }
+        .score-summary-table tr:first-child th,
+        .score-summary-table tr:first-child td {
+            border-top: none;
+        }
+        .score-summary-table th {
+            color: #607d8b;
+            font-weight: 600;
+        }
+        .score-summary-table td {
+            color: #263238;
+            font-weight: 700;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .score-chart-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(280px, 1fr));
+            gap: 14px;
+        }
+        .score-chart-card {
+            width: 100%;
+            box-sizing: border-box;
+            min-width: 0;
+        }
+        .score-chart-card svg {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        #score-query-container .score-chart-grid {
+            grid-template-columns: 1fr;
+            gap: 10px;
+        }
+        .score-semester-section {
+            margin-bottom: 18px;
+        }
+        .score-semester-header {
+            margin: 12px 0 8px 0;
+            padding: 8px 0 4px 0;
+            border-bottom: 2px solid #e0e0e0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: -4px;
+            background: #f9f9f9;
+            z-index: 10;
+        }
+        .score-semester-header h4 {
+            margin: 0;
+            color: #333;
+            font-size: 0.95rem;
+        }
+        .score-semester-header span {
+            font-weight: 700;
+            color: #4caf50;
+            font-size: 0.85rem;
+        }
+        .score-table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            background: #fff;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        }
+        .score-table {
+            width: 100%;
+            min-width: 1180px;
+            border-collapse: collapse;
+            background: #fff;
+            font-size: 0.78rem;
+            table-layout: fixed;
+        }
+        .score-table col.score-col-course { width: auto; }
+        .score-table col.score-col-nature { width: 104px; }
+        .score-table col.score-col-credit { width: 78px; }
+        .score-table col.score-col-total { width: 86px; }
+        .score-table col.score-col-grade { width: 96px; }
+        .score-table col.score-col-regular { width: 104px; }
+        .score-table col.score-col-final { width: 104px; }
+        .score-table col.score-col-regular-coeff { width: 156px; }
+        .score-table col.score-col-final-coeff { width: 156px; }
+        @media (max-width: 900px) {
+            .score-summary-grid,
+            .score-chart-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .score-table thead tr {
+            background: #3498db;
+            color: #fff;
+        }
+        .score-table th,
+        .score-table td {
+            padding: 9px 10px;
+            text-align: center;
+            border-top: 1px solid #e6e6e6;
+            vertical-align: middle;
+            line-height: 1.45;
+            white-space: nowrap;
+        }
+        .score-table th {
+            border-top: none;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .score-table th.sortable {
+            cursor: pointer;
+            user-select: none;
+            transition: background-color 0.18s ease;
+        }
+        .score-table th.sortable:hover {
+            background: #2d8dcc;
+        }
+        .score-table th.active-sort {
+            background: #2384c4;
+        }
+        .score-table .sort-indicator {
+            display: inline-block;
+            width: 1em;
+            margin-left: 4px;
+            font-size: 0.75rem;
+            line-height: 1;
+            vertical-align: middle;
+        }
+        .score-table th:first-child,
+        .score-table td:first-child {
+            text-align: left;
+        }
+        .score-table tbody tr {
+            transition: background-color 0.2s ease;
+        }
+        .score-table tbody tr:hover {
+            background: #f5f9ff;
+        }
+        .score-table .course-name-cell {
+            font-weight: 600;
+            color: #263238;
+            white-space: normal;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+        .score-table .score-number {
+            font-weight: 700;
+            color: #d81b60;
+        }
+        .score-table .score-muted {
+            color: #8a8a8a;
+        }
+        .score-table .score-coeff {
+            white-space: nowrap;
+            color: #455a64;
+        }
+        .szu-inline-score-panel {
+            padding: 16px;
+            background: #f9f9f9;
+            min-height: 240px;
+            box-sizing: border-box;
+        }
+        .szu-inline-score-toolbar {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+        .szu-inline-score-toolbar button {
+            padding: 8px 18px;
+            font-size: 14px;
+            background: #e6a23c;
+            color: #fff;
+            border: none;
+            border-radius: 20px;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+        }
+        .szu-inline-score-toolbar button:hover {
+            background: #cf8f27;
+        }
+        .szu-inline-score-hint {
+            color: #666;
+            font-size: 13px;
+        }
+        .szu-inline-progress-card {
+            margin: 0 0 14px;
+            padding: 12px 14px;
+            background: #fff;
+            border: 1px solid #e3e8ef;
+            border-radius: 8px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+        }
+        .szu-inline-progress-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+            color: #455a64;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .szu-inline-progress-percent {
+            flex: 0 0 auto;
+            color: #009688;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        .szu-inline-progress-track {
+            height: 8px;
+            overflow: hidden;
+            background: #e8eef3;
+            border-radius: 999px;
+        }
+        .szu-inline-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #26a69a, #66bb6a);
+            border-radius: inherit;
+            transition: width 0.9s cubic-bezier(0.22, 1, 0.36, 1);
+            will-change: width;
+        }
+        .szu-inline-progress-detail {
+            margin-top: 8px;
+            color: #78909c;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .szu-inline-score-empty {
+            text-align: center;
+            padding: 28px 16px;
+            color: #777;
+            font-size: 15px;
+            background: #fff;
+            border: 1px dashed #d0d0d0;
+            border-radius: 8px;
         }
         .course-item {
             padding: 16px;
@@ -397,6 +715,60 @@
         .dev-clear-btn:hover {
             background: #d32f2f;
         }
+        .dev-probe-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 8px;
+            margin-bottom: 8px;
+        }
+        .dev-probe-btn,
+        .dev-download-btn {
+            padding: 4px 10px;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: background 0.2s, opacity 0.2s;
+        }
+        .dev-probe-btn {
+            background: #3949ab;
+        }
+        .dev-probe-btn:hover {
+            background: #283593;
+        }
+        .dev-download-btn {
+            background: #1976d2;
+        }
+        .dev-download-btn:hover {
+            background: #0d47a1;
+        }
+        .dev-probe-btn:disabled,
+        .dev-download-btn:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        .dev-probe-status {
+            padding: 8px 10px;
+            margin-bottom: 8px;
+            background: #fff8e1;
+            border-left: 4px solid #f9a825;
+            border-radius: 4px;
+            color: #795548;
+            font-size: 0.78rem;
+            line-height: 1.45;
+        }
+        .dev-monitor-status {
+            padding: 8px 10px;
+            margin-bottom: 8px;
+            background: #e3f2fd;
+            border-left: 4px solid #1976d2;
+            border-radius: 4px;
+            color: #0d47a1;
+            font-size: 0.78rem;
+            line-height: 1.45;
+        }
         .dev-data-section {
             margin-bottom: 12px;
         }
@@ -503,6 +875,28 @@
                         <button class="dev-copy-btn" id="dev-copy-all-queries">复制全部查询结果</button>
                         <button class="dev-clear-btn" id="dev-clear-queries">清空记录</button>
                     </details>
+                    <details class="dev-data-section">
+                        <summary>🧪 系数接口主动探测</summary>
+                        <div class="dev-probe-actions">
+                            <button class="dev-probe-btn" id="dev-run-probe">开始探测系数接口</button>
+                            <button class="dev-copy-btn" data-target="dev-probe-data">复制探测结果</button>
+                            <button class="dev-download-btn" id="dev-download-probe-results" disabled>下载探测结果</button>
+                        </div>
+                        <div class="dev-probe-status" id="dev-probe-status">尚未探测。请先确认已登录成绩查询页面，再点击开始探测。</div>
+                        <div class="dev-data-content" id="dev-probe-data">暂无数据</div>
+                    </details>
+                    <details class="dev-data-section">
+                        <summary>📡 页面请求监听 (<span id="dev-network-count">0</span>条)</summary>
+                        <div class="dev-probe-actions">
+                            <button class="dev-probe-btn" id="dev-start-network-monitor">开始监听</button>
+                            <button class="dev-clear-btn" id="dev-stop-network-monitor" disabled>停止监听</button>
+                            <button class="dev-copy-btn" data-target="dev-network-data">复制监听结果</button>
+                            <button class="dev-download-btn" id="dev-download-network-captures" disabled>下载监听结果</button>
+                            <button class="dev-clear-btn" id="dev-clear-network-captures">清空监听记录</button>
+                        </div>
+                        <div class="dev-monitor-status" id="dev-network-status">尚未监听。点击开始监听后，请在官方成绩页面点击“详情”等操作。</div>
+                        <div class="dev-data-content" id="dev-network-data">暂无数据</div>
+                    </details>
                 </div>
             </div>
 
@@ -587,6 +981,84 @@
             updateDevQueryDisplay();
         });
 
+        // 系数接口主动探测
+        container.querySelector('#dev-run-probe').addEventListener('click', async () => {
+            if (scriptState.isProbing) return;
+
+            const runProbeBtn = container.querySelector('#dev-run-probe');
+            const probeStatusEl = container.querySelector('#dev-probe-status');
+            const downloadBtn = container.querySelector('#dev-download-probe-results');
+
+            scriptState.isProbing = true;
+            runProbeBtn.disabled = true;
+            downloadBtn.disabled = true;
+            scriptState.rawData.probeResults = null;
+            updateDevProbeDisplay();
+
+            const updateProbeStatus = (message) => {
+                if (probeStatusEl) probeStatusEl.textContent = message;
+            };
+
+            const updateProbeResults = (results) => {
+                scriptState.rawData.probeResults = results;
+                updateDevProbeDisplay();
+                downloadBtn.disabled = !scriptState.rawData.probeResults;
+            };
+
+            try {
+                const results = await runCoefficientEndpointProbe(updateProbeStatus, updateProbeResults);
+                scriptState.rawData.probeResults = results;
+                const officialHitCount = results.officialCoefficientProbe?.coefficientHits?.length || 0;
+                updateProbeStatus(`探测完成：官方系数命中 ${officialHitCount} 条，扫描资源 ${results.discovery.resourcesScanned.length} 个，候选接口 ${results.candidates.length} 个，请下载 JSON 发回分析。`);
+                updateDevProbeDisplay();
+            } catch (err) {
+                console.error('[深大成绩查询] 接口探测失败:', err);
+                updateProbeStatus(`探测失败：${err.message}`);
+                scriptState.rawData.probeResults = {
+                    ...(scriptState.rawData.probeResults || {}),
+                    state: 'failed',
+                    failedAt: new Date().toISOString(),
+                    error: err.message,
+                    stack: err.stack
+                };
+                updateDevProbeDisplay();
+            } finally {
+                scriptState.isProbing = false;
+                runProbeBtn.disabled = false;
+                downloadBtn.disabled = !scriptState.rawData.probeResults;
+            }
+        });
+
+        container.querySelector('#dev-download-probe-results').addEventListener('click', () => {
+            if (!scriptState.rawData.probeResults) {
+                alert('暂无探测结果，请先执行探测。');
+                return;
+            }
+            downloadJsonFile(scriptState.rawData.probeResults, `szu-score-probe-${formatDateTimeForFilename(new Date())}.json`);
+        });
+
+        container.querySelector('#dev-start-network-monitor').addEventListener('click', () => {
+            startNetworkMonitor();
+        });
+
+        container.querySelector('#dev-stop-network-monitor').addEventListener('click', () => {
+            stopNetworkMonitor();
+        });
+
+        container.querySelector('#dev-download-network-captures').addEventListener('click', () => {
+            if (!scriptState.rawData.networkCaptures.length) {
+                alert('暂无监听结果，请先开始监听并操作官方页面。');
+                return;
+            }
+            const payload = buildNetworkCaptureExport();
+            downloadJsonFile(payload, `szu-score-network-captures-${formatDateTimeForFilename(new Date())}.json`);
+        });
+
+        container.querySelector('#dev-clear-network-captures').addEventListener('click', () => {
+            scriptState.rawData.networkCaptures = [];
+            updateDevNetworkDisplay();
+        });
+
         startBtn.addEventListener('click', async () => {
             if (scriptState.isRunning) return;
 
@@ -595,24 +1067,26 @@
             scriptState.isRunning = true;
             startBtn.disabled = true;
             exportBtn.disabled = true;
+            scriptState.courseData = [];
             resultsEl.innerHTML = '';
+            renderInlineScorePanel();
             progressEl.style.width = '0%';
             // 显示进度条区域
             const progressContainer = container.querySelector('.progress-container');
             progressContainer.classList.remove('completed');
             progressContainer.classList.add('active');
-            statusEl.textContent = '正在获取课程列表...';
+            setQueryProgress(2, '正在获取课程列表...', '正在连接成绩查询接口。');
 
             try {
                 // 1. 获取初始课程列表
                 const initialCourses = await fetchInitialCourseList();
                 if (!initialCourses || initialCourses.length === 0) {
-                    statusEl.textContent = '未找到任何课程记录，请确认当前学期有成绩。';
+                    setQueryProgress(100, '未找到任何课程记录，请确认当前学期有成绩。', '', false);
                     return;
                 }
 
                 // 2. 优先获取课程系数（新增逻辑）
-                statusEl.textContent = `正在获取课程系数 (0/${initialCourses.length})...`;
+                setQueryProgress(8, `正在获取课程系数 (0/${initialCourses.length})...`, '正在读取每门课的成绩项配置。');
                 const coefficientMap = new Map();
                 
                 // 分批并发获取系数
@@ -627,7 +1101,8 @@
                             }
                         }
                     }));
-                    statusEl.textContent = `正在获取课程系数 (${Math.min(i + batchSize, initialCourses.length)}/${initialCourses.length})...`;
+                    const coefficientProgress = 8 + Math.round((Math.min(i + batchSize, initialCourses.length) / initialCourses.length) * 12);
+                    setQueryProgress(coefficientProgress, `正在获取课程系数 (${Math.min(i + batchSize, initialCourses.length)}/${initialCourses.length})...`, '正在读取每门课的成绩项配置。');
                     await new Promise(r => setTimeout(r, 50)); // 稍微延时防止请求过快
                 }
 
@@ -690,7 +1165,7 @@
                 let pscjFoundCount = 0;
                 let qmcjFoundCount = 0;
                 
-                statusEl.textContent = '正在查询详细成绩...';
+                setQueryProgress(20, '正在查询详细成绩...', '正在并行扫描平时成绩和期末成绩。');
 
                 // 3. 十线程并行分段查询策略
                 // 10个线程分别处理10个分数段，每个线程处理约10个分数
@@ -718,9 +1193,13 @@
                 // 更新进度显示
                 const updateProgress = () => {
                     const totalScores = 101;
-                    const progress = Math.min((sharedState.queriedScores.size / totalScores) * 100, 100);
-                    progressEl.style.width = `${progress}%`;
-                    statusEl.textContent = `并行查询中... [平时:${sharedState.pscjFoundCount}/${needPscjCount} 期末:${sharedState.qmcjFoundCount}/${needQmcjCount}] (已查${sharedState.queriedScores.size}个分数)`;
+                    const scanProgress = Math.min((sharedState.queriedScores.size / totalScores) * 100, 100);
+                    const progress = Math.min(20 + scanProgress * 0.78, 98);
+                    setQueryProgress(
+                        progress,
+                        `并行查询中... [平时:${sharedState.pscjFoundCount}/${needPscjCount} 期末:${sharedState.qmcjFoundCount}/${needQmcjCount}] (已查${sharedState.queriedScores.size}个分数)`,
+                        `已扫描 ${sharedState.queriedScores.size}/${totalScores} 个分数点。`
+                    );
                 };
                 
                 // 检查是否所有成绩都已找到
@@ -893,18 +1372,18 @@
                 pscjFoundCount = sharedState.pscjFoundCount;
                 qmcjFoundCount = sharedState.qmcjFoundCount;
 
-                progressEl.style.width = '100%';
-                statusEl.textContent = `查询完成！共 ${courseMap.size} 门课程`;
+                setQueryProgress(100, `查询完成！共 ${courseMap.size} 门课程`, '结果已刷新到页面内表格和悬浮窗。', false);
                 // 查询完成后隐藏进度条区域
                 container.querySelector('.progress-container').classList.add('completed');
                 exportBtn.disabled = false;
 
             } catch (err) {
                 console.error("查询过程中发生错误:", err);
-                statusEl.textContent = `查询异常: ${err.message}`;
+                setQueryProgress(100, `查询异常: ${err.message}`, '请检查登录状态或网络请求结果。', false);
             } finally {
                 scriptState.isRunning = false;
                 startBtn.disabled = false;
+                renderInlineScorePanel();
             }
         });
 
@@ -1157,9 +1636,9 @@
             }
 
             return `
-                <div style="margin-bottom:8px;">
+                <div class="score-chart-card">
                     <div style="font-size:0.8rem;color:#666;margin-bottom:4px;font-weight:500;">${title}</div>
-                    <svg width="${chartWidth}" height="${chartHeight}" style="background:#fff;border-radius:6px;border:1px solid #e0e0e0;">
+                    <svg width="${chartWidth}" height="${chartHeight}" viewBox="0 0 ${chartWidth} ${chartHeight}" style="background:#fff;border-radius:6px;border:1px solid #e0e0e0;">
                         <!-- 网格线 -->
                         ${yTicks.map(t => `<line x1="${padding.left}" y1="${t.y}" x2="${chartWidth - padding.right}" y2="${t.y}" stroke="#f0f0f0" stroke-width="1"/>`).join('')}
                         
@@ -1185,7 +1664,7 @@
             `;
         }
 
-        let html = '<div style="margin-top:8px;">';
+        let html = '<div class="score-chart-grid">';
         
         // 学期 GPA 趋势
         if (semesterData.length >= 2) {
@@ -1202,20 +1681,21 @@
         return html;
     }
 
-    function renderResults() {
-        const resultsEl = scriptState.container.querySelector('#score-results');
-        resultsEl.innerHTML = '';
-        
-        const courses = scriptState.courseData;
-        if (courses.length === 0) {
-            resultsEl.innerHTML = '<div style="text-align:center;padding:20px;color:#999;">暂无数据</div>';
+    function appendScoreResultsContent(container, courses) {
+        container.innerHTML = '';
+
+        if (!courses || courses.length === 0) {
+            container.innerHTML = '<div style="text-align:center;padding:20px;color:#999;">暂无数据</div>';
             return;
         }
 
-        // 1. 计算总 GPA
+        appendScoreSummary(container, courses);
+        appendScoreSemesterTables(container, buildSemesterGroups(courses));
+    }
+
+    function appendScoreSummary(container, courses) {
         const totalGPA = calculateGPA(courses);
 
-        // 2. 计算学年 GPA
         const yearGroups = {};
         courses.forEach(course => {
             const year = course.XNXQDM ? course.XNXQDM.substring(0, 9) : '未知学年';
@@ -1240,39 +1720,427 @@
             });
         });
 
-        // 4. 渲染概览区域
         const summaryDiv = document.createElement('div');
-        summaryDiv.style.cssText = 'background:#e3f2fd;padding:12px;border-radius:8px;margin-bottom:16px;border:1px solid #bbdefb;';
-        let summaryHTML = `<div style="font-size:1.1rem;font-weight:bold;color:#1565c0;margin-bottom:8px;">总 GPA: ${totalGPA}</div>`;
-        summaryHTML += `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">`;
-        yearGPAs.forEach(item => {
-            summaryHTML += `<span style="background:#fff;padding:4px 8px;border-radius:4px;font-size:0.85rem;color:#555;border:1px solid #e0e0e0;">${item.year}学年: <b>${item.gpa}</b></span>`;
-        });
-        summaryHTML += `</div>`;
-        
-        // 5. 添加 GPA 趋势图
+        summaryDiv.className = 'score-summary-card';
+        let summaryHTML = `<div class="score-summary-title">总 GPA: ${totalGPA}</div>`;
+        summaryHTML += '<div class="score-summary-grid">';
+        summaryHTML += buildScoreSummaryTable(
+            '学期 GPA',
+            semesterGPAData.slice().reverse().map(item => ({
+                label: item.label,
+                value: item.gpa.toFixed(2)
+            }))
+        );
+        summaryHTML += buildScoreSummaryTable(
+            '学年 GPA',
+            yearGPAs.map(item => ({
+                label: `${item.year}学年`,
+                value: item.gpa
+            }))
+        );
+        summaryHTML += '</div>';
         summaryHTML += renderGPAChart(semesterGPAData, yearGPAs);
-        
         summaryDiv.innerHTML = summaryHTML;
-        resultsEl.appendChild(summaryDiv);
+        container.appendChild(summaryDiv);
+    }
 
-        // 4. 按学期分组并渲染
+    function buildScoreSummaryTable(title, rows) {
+        const body = rows.length
+            ? rows.map(row => `
+                <tr>
+                    <th>${escapeHtml(row.label)}</th>
+                    <td>${escapeHtml(row.value)}</td>
+                </tr>
+            `).join('')
+            : '<tr><th>暂无数据</th><td>-</td></tr>';
+
+        return `
+            <div class="score-summary-panel">
+                <div class="score-summary-panel-title">${escapeHtml(title)}</div>
+                <table class="score-summary-table">
+                    <tbody>${body}</tbody>
+                </table>
+            </div>
+        `;
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function buildSemesterGroups(courses) {
         const sortedCourses = [...courses].sort((a, b) => {
             if (a.XNXQDM !== b.XNXQDM) {
                 return (b.XNXQDM || '').localeCompare(a.XNXQDM || '');
             }
-            return a.KCM.localeCompare(b.KCM);
+            return String(a.KCM || '').localeCompare(String(b.KCM || ''), 'zh-Hans');
         });
 
         const semesterGroups = new Map();
         sortedCourses.forEach(course => {
-            const key = course.XNXQDM_DISPLAY || '未知学期';
+            const key = course.XNXQDM_DISPLAY || course.XNXQDM || '未知学期';
             if (!semesterGroups.has(key)) {
                 semesterGroups.set(key, []);
             }
             semesterGroups.get(key).push(course);
         });
 
+        return semesterGroups;
+    }
+
+    function getScoreTableColumns() {
+        return [
+            {
+                title: '课程名称',
+                field: 'courseName',
+                type: 'text',
+                colClass: 'score-col-course',
+                value: course => course.KCM
+            },
+            {
+                title: '课程性质',
+                field: 'nature',
+                type: 'text',
+                colClass: 'score-col-nature',
+                value: course => formatCourseNature(course)
+            },
+            {
+                title: '学分',
+                field: 'credit',
+                type: 'number',
+                colClass: 'score-col-credit',
+                value: course => course.XF
+            },
+            {
+                title: '总成绩',
+                field: 'totalScore',
+                type: 'number',
+                colClass: 'score-col-total',
+                value: course => calculateFinalScoreAndGrade(course).finalScore
+            },
+            {
+                title: '等级成绩',
+                field: 'grade',
+                type: 'text',
+                colClass: 'score-col-grade',
+                value: course => {
+                    const { grade } = calculateFinalScoreAndGrade(course);
+                    return course.DJCJMC || grade;
+                }
+            },
+            {
+                title: '平时成绩',
+                field: 'regularScore',
+                type: 'number',
+                colClass: 'score-col-regular',
+                value: course => course.PSCJ
+            },
+            {
+                title: '期末成绩',
+                field: 'finalScorePart',
+                type: 'number',
+                colClass: 'score-col-final',
+                value: course => course.QMCJ
+            },
+            {
+                title: '平时成绩系数',
+                field: 'regularCoeff',
+                type: 'number',
+                colClass: 'score-col-regular-coeff',
+                value: course => course.PSCJXS
+            },
+            {
+                title: '期末成绩系数',
+                field: 'finalCoeff',
+                type: 'number',
+                colClass: 'score-col-final-coeff',
+                value: course => course.QMCJXS
+            }
+        ];
+    }
+
+    function getCurrentTableSort() {
+        const defaultSort = { field: 'courseName', direction: 'asc' };
+        const fields = getScoreTableColumns().map(column => column.field);
+        const sort = scriptState.tableSort || defaultSort;
+        const direction = sort.direction === 'desc' ? 'desc' : 'asc';
+
+        if (!fields.includes(sort.field)) {
+            return defaultSort;
+        }
+
+        return {
+            field: sort.field,
+            direction
+        };
+    }
+
+    function setTableSort(field) {
+        const currentSort = getCurrentTableSort();
+        const nextDirection = currentSort.field === field && currentSort.direction === 'asc' ? 'desc' : 'asc';
+
+        scriptState.tableSort = {
+            field,
+            direction: nextDirection
+        };
+
+        renderInlineScorePanel();
+    }
+
+    function appendScoreTableHeaderCell(row, column) {
+        const currentSort = getCurrentTableSort();
+        const isActive = currentSort.field === column.field;
+        const cell = appendTableCell(row, '', 'th', isActive ? 'sortable active-sort' : 'sortable');
+        const label = document.createElement('span');
+        label.textContent = column.title;
+
+        const indicator = document.createElement('span');
+        indicator.className = 'sort-indicator';
+        indicator.textContent = isActive ? (currentSort.direction === 'asc' ? '↑' : '↓') : '';
+
+        cell.setAttribute('aria-sort', isActive ? (currentSort.direction === 'asc' ? 'ascending' : 'descending') : 'none');
+        cell.title = `点击按${column.title}排序`;
+        cell.addEventListener('click', () => setTableSort(column.field));
+        cell.appendChild(label);
+        cell.appendChild(indicator);
+        return cell;
+    }
+
+    function sortCoursesForTable(courses) {
+        const currentSort = getCurrentTableSort();
+        const columns = getScoreTableColumns();
+        const column = columns.find(item => item.field === currentSort.field) || columns[0];
+
+        return [...courses].sort((a, b) => compareScoreTableCourses(a, b, column, currentSort.direction));
+    }
+
+    function compareScoreTableCourses(a, b, column, direction) {
+        const left = getTableSortValue(a, column);
+        const right = getTableSortValue(b, column);
+
+        if (left.missing && right.missing) {
+            return compareCourseNameAsc(a, b);
+        }
+        if (left.missing) return 1;
+        if (right.missing) return -1;
+
+        const primary = column.type === 'number'
+            ? left.value - right.value
+            : compareSortText(left.value, right.value);
+
+        if (primary !== 0) {
+            return direction === 'desc' ? -primary : primary;
+        }
+
+        return compareCourseNameAsc(a, b);
+    }
+
+    function getTableSortValue(course, column) {
+        const rawValue = column.value(course);
+
+        if (column.type === 'number') {
+            const value = parseSortableNumber(rawValue);
+            return {
+                missing: value === null,
+                value
+            };
+        }
+
+        const value = normalizeSortText(rawValue);
+        return {
+            missing: value === '',
+            value
+        };
+    }
+
+    function compareCourseNameAsc(a, b) {
+        const courseName = compareSortText(normalizeSortText(a.KCM), normalizeSortText(b.KCM));
+        if (courseName !== 0) return courseName;
+        return compareSortText(normalizeSortText(a.KCH || a.KCDM), normalizeSortText(b.KCH || b.KCDM));
+    }
+
+    function compareSortText(left, right) {
+        return String(left || '').localeCompare(String(right || ''), 'zh-Hans', {
+            numeric: true,
+            sensitivity: 'base'
+        });
+    }
+
+    function normalizeSortText(value) {
+        if (value === null || value === undefined) return '';
+        const text = String(value).trim();
+        if (!text || text === '-' || text === 'N/A' || text === '?' || text === '查询中') return '';
+        return text;
+    }
+
+    function parseSortableNumber(value) {
+        if (value === null || value === undefined) return null;
+        const text = String(value).replace(/\*/g, '').replace(/%/g, '').trim();
+        if (!text || text === '-' || text === 'N/A' || text === '?' || text === '查询中') return null;
+
+        const matched = text.match(/-?\d+(?:\.\d+)?/);
+        if (!matched) return null;
+
+        const numeric = Number(matched[0]);
+        return Number.isFinite(numeric) ? numeric : null;
+    }
+
+    function appendScoreSemesterTables(container, semesterGroups) {
+        semesterGroups.forEach((semesterCourses, semesterName) => {
+            const semesterGPA = calculateGPA(semesterCourses);
+
+            const section = document.createElement('section');
+            section.className = 'score-semester-section';
+
+            const semesterHeader = document.createElement('div');
+            semesterHeader.className = 'score-semester-header';
+            semesterHeader.innerHTML = `<h4>${semesterName}</h4><span>GPA: ${semesterGPA}</span>`;
+            section.appendChild(semesterHeader);
+
+            const tableWrap = document.createElement('div');
+            tableWrap.className = 'score-table-wrap';
+            tableWrap.appendChild(createScoreTable(semesterCourses));
+            section.appendChild(tableWrap);
+            container.appendChild(section);
+        });
+    }
+
+    function createScoreTable(courses) {
+        const table = document.createElement('table');
+        table.className = 'score-table';
+        const columns = getScoreTableColumns();
+        const sortedCourses = sortCoursesForTable(courses);
+
+        const colGroup = document.createElement('colgroup');
+        columns.forEach(column => {
+            const col = document.createElement('col');
+            col.className = column.colClass;
+            colGroup.appendChild(col);
+        });
+        table.appendChild(colGroup);
+
+        const thead = document.createElement('thead');
+        const headRow = document.createElement('tr');
+        columns.forEach(column => appendScoreTableHeaderCell(headRow, column));
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        sortedCourses.forEach(course => {
+            const { finalScore, grade } = calculateFinalScoreAndGrade(course);
+            const tr = document.createElement('tr');
+
+            appendTableCell(tr, normalizeDisplayValue(course.KCM), 'td', 'course-name-cell');
+            appendTableCell(tr, formatCourseNature(course), 'td');
+            appendTableCell(tr, normalizeDisplayValue(course.XF), 'td');
+            appendTableCell(tr, normalizeDisplayValue(finalScore), 'td', 'score-number');
+            appendTableCell(tr, normalizeDisplayValue(course.DJCJMC || grade), 'td');
+            appendTableCell(tr, formatScoreDisplay(course.PSCJ), 'td', scoreCellClass(course.PSCJ));
+            appendTableCell(tr, formatScoreDisplay(course.QMCJ), 'td', scoreCellClass(course.QMCJ));
+            appendTableCell(tr, formatCoefficient(course.PSCJXS), 'td', 'score-coeff');
+            appendTableCell(tr, formatCoefficient(course.QMCJXS), 'td', 'score-coeff');
+
+            tbody.appendChild(tr);
+        });
+
+        table.appendChild(tbody);
+        return table;
+    }
+
+    function appendTableCell(row, value, tagName, className) {
+        const cell = document.createElement(tagName);
+        cell.textContent = value;
+        if (className) cell.className = className;
+        row.appendChild(cell);
+        return cell;
+    }
+
+    function normalizeDisplayValue(value) {
+        if (value === null || value === undefined || value === '') return '-';
+        return String(value);
+    }
+
+    function formatScoreDisplay(value) {
+        if (value === 'N/A') return '查询中';
+        return normalizeDisplayValue(value);
+    }
+
+    function scoreCellClass(value) {
+        return value === 'N/A' || value === '?' || value === null || value === undefined ? 'score-muted' : 'score-number';
+    }
+
+    function formatCourseNature(course) {
+        const rawValue = normalizeDisplayValue(course?.KCXZDM_DISPLAY || course?.KCXZDM);
+        const code = String(course?.KCXZDM || course?.KCXZDM_DISPLAY || '').trim();
+        const natureMap = {
+            '01': '必修课',
+            '02': '选修课',
+            '必修': '必修课',
+            '选修': '选修课'
+        };
+
+        if (natureMap[code]) return natureMap[code];
+        if (natureMap[rawValue]) return natureMap[rawValue];
+        return rawValue;
+    }
+
+    function renderResults() {
+        const resultsEl = scriptState.container.querySelector('#score-results');
+        renderFloatingResults(resultsEl, scriptState.courseData);
+        renderInlineScorePanel();
+    }
+
+    function renderFloatingResults(resultsEl, courses) {
+        resultsEl.innerHTML = '';
+
+        if (!courses || courses.length === 0) {
+            resultsEl.innerHTML = '<div style="text-align:center;padding:20px;color:#999;">暂无数据</div>';
+            return;
+        }
+
+        const totalGPA = calculateGPA(courses);
+
+        const yearGroups = {};
+        courses.forEach(course => {
+            const year = course.XNXQDM ? course.XNXQDM.substring(0, 9) : '未知学年';
+            if (!yearGroups[year]) yearGroups[year] = [];
+            yearGroups[year].push(course);
+        });
+
+        const yearGPAs = Object.keys(yearGroups).sort().reverse().map(year => {
+            return { year, gpa: calculateGPA(yearGroups[year]) };
+        });
+
+        const semesterGPAData = [];
+        const semesterKeys = [...new Set(courses.map(c => c.XNXQDM))].sort();
+        semesterKeys.forEach(xnxqdm => {
+            const semesterCourses = courses.filter(c => c.XNXQDM === xnxqdm);
+            const displayName = semesterCourses[0]?.XNXQDM_DISPLAY || xnxqdm;
+            semesterGPAData.push({
+                key: xnxqdm,
+                label: displayName.replace('学年', '').replace('学期', ''),
+                gpa: parseFloat(calculateGPA(semesterCourses))
+            });
+        });
+
+        const summaryDiv = document.createElement('div');
+        summaryDiv.style.cssText = 'background:#e3f2fd;padding:12px;border-radius:8px;margin-bottom:16px;border:1px solid #bbdefb;';
+        let summaryHTML = `<div style="font-size:1.1rem;font-weight:bold;color:#1565c0;margin-bottom:8px;">总 GPA: ${totalGPA}</div>`;
+        summaryHTML += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">';
+        yearGPAs.forEach(item => {
+            summaryHTML += `<span style="background:#fff;padding:4px 8px;border-radius:4px;font-size:0.85rem;color:#555;border:1px solid #e0e0e0;">${item.year}学年: <b>${item.gpa}</b></span>`;
+        });
+        summaryHTML += '</div>';
+        summaryHTML += renderGPAChart(semesterGPAData, yearGPAs);
+        summaryDiv.innerHTML = summaryHTML;
+        resultsEl.appendChild(summaryDiv);
+
+        const semesterGroups = buildSemesterGroups(courses);
         semesterGroups.forEach((semesterCourses, semesterName) => {
             const semesterGPA = calculateGPA(semesterCourses);
 
@@ -1290,7 +2158,7 @@
                         <strong>${course.KCM}</strong>
                         <span>${course.KCLBDM_DISPLAY || ''}</span>
                     </div>
-                    
+
                     <div class="course-detail">
                         <span class="tag">课程学分: ${course.XF || 'N/A'}</span>
                         <span class="tag">等级制成绩: ${course.XFJD || 'N/A'}</span>
@@ -1298,12 +2166,12 @@
                     <div class="course-detail">
                         开课学院: ${course.KKDWDM_DISPLAY || 'N/A'}
                     </div>
-                    
+
                     <div class="course-detail full-width score-row">
                         <span>平时: <b style="color: #4CAF50;">${course.PSCJ}</b> (${formatCoefficient(course.PSCJXS)})</span>
                         <span>期末: <b style="color: #FF5722;">${course.QMCJ}</b> (${formatCoefficient(course.QMCJXS)})</span>
                     </div>
-                    
+
                     <div class="course-detail full-width score-row" style="margin-top: 4px; padding-top: 4px; border-top: 1px solid #eee;">
                         <span>总评: <span class="final-score">${finalScore}</span> <span class="final-score">(${grade})</span></span>
                     </div>
@@ -1315,7 +2183,8 @@
 
     // 格式化系数显示
     function formatCoefficient(xs) {
-        if (!xs || xs === '?') return '?';
+        if (xs === null || xs === undefined || xs === '' || xs === '?') return '?';
+        if (xs === '-') return '-';
         if (typeof xs === 'string' && xs.endsWith('*')) {
             // 推断值，显示带提示
             return xs.replace('*', '') + '% (推断)';
@@ -1323,45 +2192,330 @@
         return xs + '%';
     }
 
+    function installInlineScoreTab() {
+        if (scriptState.inlineScoreTab.installed) return;
+
+        waitForElement('.jqx-tabs-title-container', 12000).then(tabList => {
+            if (!tabList || scriptState.inlineScoreTab.installed) return;
+            if (document.querySelector('[data-szu-score-inline-tab="1"]')) return;
+
+            const tab = createInlineScoreTab();
+            const panel = createInlineScorePanel();
+            const contentContainer = findInlineScoreContentContainer();
+
+            if (!contentContainer) {
+                console.warn('[深大成绩查询] 未找到官方成绩页面内容容器，无法注入详细成绩表格页。');
+                return;
+            }
+
+            tabList.appendChild(tab);
+            contentContainer.appendChild(panel);
+
+            tab.addEventListener('click', () => activateInlineScoreTab(tab, panel));
+            bindOriginalTabsForInlinePanel(tab, panel);
+
+            scriptState.inlineScoreTab.installed = true;
+            scriptState.inlineScoreTab.tab = tab;
+            scriptState.inlineScoreTab.panel = panel;
+            renderInlineScorePanel();
+        });
+    }
+
+    function waitForElement(selector, timeoutMs) {
+        const existing = document.querySelector(selector);
+        if (existing) return Promise.resolve(existing);
+
+        return new Promise(resolve => {
+            const started = Date.now();
+            const timer = setInterval(() => {
+                const element = document.querySelector(selector);
+                if (element) {
+                    clearInterval(timer);
+                    resolve(element);
+                    return;
+                }
+
+                if (Date.now() - started >= timeoutMs) {
+                    clearInterval(timer);
+                    resolve(null);
+                }
+            }, 250);
+        });
+    }
+
+    function createInlineScoreTab() {
+        const tab = document.createElement('li');
+        tab.setAttribute('role', 'tab');
+        tab.setAttribute('data-szu-score-inline-tab', '1');
+        tab.className = 'jqx-reset jqx-disableselect jqx-tabs-title jqx-item jqx-rc-t jqx-fill-state-pressed';
+        tab.style.float = 'left';
+
+        const titleWrapper = document.createElement('div');
+        titleWrapper.className = 'jqx-tabs-titleWrapper';
+        titleWrapper.style.cssText = 'outline:none;position:relative;z-index:15;height:100%;';
+
+        const titleContentWrapper = document.createElement('div');
+        titleContentWrapper.className = 'jqx-tabs-titleContentWrapper jqx-disableselect';
+        titleContentWrapper.style.cssText = 'float:left;margin-top:-0.5px;';
+        titleContentWrapper.textContent = '详细成绩表格版';
+
+        titleWrapper.appendChild(titleContentWrapper);
+        tab.appendChild(titleWrapper);
+        return tab;
+    }
+
+    function createInlineScorePanel() {
+        const panel = document.createElement('div');
+        panel.className = 'cjcx-tab-content-2 bh-mt-8 jqx-tabs-content-element jqx-rc-b szu-inline-score-panel';
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('data-szu-score-inline-panel', '1');
+        panel.style.display = 'none';
+        return panel;
+    }
+
+    function findInlineScoreContentContainer() {
+        const existingPanel = document.querySelector('.jqx-tabs-content-element');
+        if (existingPanel && existingPanel.parentElement) return existingPanel.parentElement;
+
+        return document.querySelector('.jqx-widget-content') || document.querySelector('[role="tabpanel"]')?.parentElement;
+    }
+
+    function bindOriginalTabsForInlinePanel(inlineTab, inlinePanel) {
+        document.querySelectorAll('ul.jqx-tabs-title-container > li').forEach(tab => {
+            if (tab === inlineTab) return;
+            tab.addEventListener('click', () => {
+                inlineTab.classList.remove('jqx-tabs-title-selected-top');
+                inlinePanel.style.display = 'none';
+            });
+        });
+    }
+
+    function activateInlineScoreTab(tab, panel) {
+        document.querySelectorAll('.jqx-tabs-title-container > li').forEach(item => {
+            item.classList.remove('jqx-tabs-title-selected-top');
+        });
+        tab.classList.add('jqx-tabs-title-selected-top');
+
+        document.querySelectorAll('.jqx-tabs-content-element').forEach(content => {
+            content.style.display = 'none';
+        });
+        panel.style.display = 'block';
+        renderInlineScorePanel();
+    }
+
+    function renderInlineScorePanel() {
+        const panel = scriptState.inlineScoreTab.panel;
+        if (!panel) return;
+
+        panel.innerHTML = '';
+
+        const toolbar = document.createElement('div');
+        toolbar.className = 'szu-inline-score-toolbar';
+
+        const refreshButton = document.createElement('button');
+        refreshButton.type = 'button';
+        refreshButton.textContent = scriptState.courseData.length ? '重新获取成绩' : '获取详细成绩';
+        refreshButton.disabled = scriptState.isRunning;
+        refreshButton.addEventListener('click', () => {
+            if (scriptState.isRunning) return;
+            scriptState.container?.querySelector('#start-query')?.click();
+            renderInlineScorePanel();
+        });
+
+        const openPanelButton = document.createElement('button');
+        openPanelButton.type = 'button';
+        openPanelButton.textContent = '打开悬浮窗';
+        openPanelButton.addEventListener('click', () => {
+            scriptState.container?.classList.remove('hidden');
+        });
+
+        const hint = document.createElement('span');
+        hint.className = 'szu-inline-score-hint';
+        hint.textContent = scriptState.isRunning
+            ? '正在查询，结果会自动刷新到这里。'
+            : '使用当前助手查询结果渲染，与悬浮窗和 Excel 导出保持一致。';
+
+        toolbar.appendChild(refreshButton);
+        toolbar.appendChild(openPanelButton);
+        toolbar.appendChild(hint);
+        panel.appendChild(toolbar);
+
+        const progressCard = createInlineProgressCard();
+        if (progressCard) {
+            panel.appendChild(progressCard);
+        }
+
+        const resultHost = document.createElement('div');
+        panel.appendChild(resultHost);
+
+        if (scriptState.courseData.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'szu-inline-score-empty';
+            empty.textContent = scriptState.isRunning ? '正在获取成绩数据...' : '暂无成绩数据，请点击上方按钮开始查询。';
+            resultHost.appendChild(empty);
+            return;
+        }
+
+        appendScoreResultsContent(resultHost, scriptState.courseData);
+    }
+
+    function createInlineProgressCard() {
+        const progress = scriptState.queryProgress;
+        if (!progress?.updatedAt) return null;
+
+        const percent = normalizeProgressPercent(progress.percent);
+        const card = document.createElement('div');
+        card.className = 'szu-inline-progress-card';
+
+        const head = document.createElement('div');
+        head.className = 'szu-inline-progress-head';
+
+        const message = document.createElement('span');
+        message.className = 'szu-inline-progress-message';
+        message.textContent = progress.message || '准备就绪';
+
+        const percentText = document.createElement('span');
+        percentText.className = 'szu-inline-progress-percent';
+        percentText.textContent = `${Math.round(percent)}%`;
+
+        head.appendChild(message);
+        head.appendChild(percentText);
+
+        const track = document.createElement('div');
+        track.className = 'szu-inline-progress-track';
+
+        const fill = document.createElement('div');
+        fill.className = 'szu-inline-progress-fill';
+        fill.style.width = `${percent}%`;
+        track.appendChild(fill);
+
+        card.appendChild(head);
+        card.appendChild(track);
+
+        if (progress.detail) {
+            const detail = document.createElement('div');
+            detail.className = 'szu-inline-progress-detail';
+            detail.textContent = progress.detail;
+            card.appendChild(detail);
+        }
+
+        return card;
+    }
+
+    function setQueryProgress(percent, message, detail = '', active = true) {
+        const normalizedPercent = normalizeProgressPercent(percent);
+        scriptState.queryProgress = {
+            active,
+            percent: normalizedPercent,
+            message,
+            detail,
+            updatedAt: new Date().toISOString()
+        };
+
+        const statusEl = scriptState.container?.querySelector('#status');
+        const progressEl = scriptState.container?.querySelector('#progress');
+        const progressContainer = scriptState.container?.querySelector('.progress-container');
+
+        if (statusEl) statusEl.textContent = message;
+        if (progressEl) progressEl.style.width = `${normalizedPercent}%`;
+        if (progressContainer && active) {
+            progressContainer.classList.remove('completed');
+            progressContainer.classList.add('active');
+        }
+
+        updateInlineProgressCard();
+    }
+
+    function updateInlineProgressCard() {
+        const panel = scriptState.inlineScoreTab.panel;
+        if (!panel) return;
+
+        let card = panel.querySelector('.szu-inline-progress-card');
+        const progress = scriptState.queryProgress;
+
+        if (!progress?.updatedAt) {
+            if (card) card.remove();
+            return;
+        }
+
+        if (!card) {
+            renderInlineScorePanel();
+            return;
+        }
+
+        const percent = normalizeProgressPercent(progress.percent);
+        const message = card.querySelector('.szu-inline-progress-message');
+        const percentText = card.querySelector('.szu-inline-progress-percent');
+        const fill = card.querySelector('.szu-inline-progress-fill');
+
+        if (message) message.textContent = progress.message || '准备就绪';
+        if (percentText) percentText.textContent = `${Math.round(percent)}%`;
+        if (fill) {
+            requestAnimationFrame(() => {
+                fill.style.width = `${percent}%`;
+            });
+        }
+
+        let detail = card.querySelector('.szu-inline-progress-detail');
+        if (progress.detail) {
+            if (!detail) {
+                detail = document.createElement('div');
+                detail.className = 'szu-inline-progress-detail';
+                card.appendChild(detail);
+            }
+            detail.textContent = progress.detail;
+        } else if (detail) {
+            detail.remove();
+        }
+    }
+
+    function normalizeProgressPercent(percent) {
+        const numeric = Number(percent);
+        if (!Number.isFinite(numeric)) return 0;
+        return Math.max(0, Math.min(100, numeric));
+    }
+
     // 更新开发者模式数据显示
     function updateDevDataDisplay() {
         if (!scriptState.container) return;
-        
+
         const initialDataEl = scriptState.container.querySelector('#dev-initial-data');
-        
+
         if (initialDataEl && scriptState.rawData.initialCourses !== null) {
             initialDataEl.textContent = JSON.stringify(scriptState.rawData.initialCourses, null, 2);
         }
-        
+
         updateDevQueryDisplay();
+        updateDevProbeDisplay();
+        updateDevNetworkDisplay();
     }
 
     // 更新轮询查询结果显示
     function updateDevQueryDisplay() {
         if (!scriptState.container) return;
-        
+
         const queryListEl = scriptState.container.querySelector('#dev-query-list');
         const queryCountEl = scriptState.container.querySelector('#dev-query-count');
-        
+
         if (!queryListEl || !queryCountEl) return;
-        
+
         const results = scriptState.rawData.queryResults;
         queryCountEl.textContent = results.length;
-        
+
         if (results.length === 0) {
             queryListEl.innerHTML = '<div style="padding:12px;color:#999;text-align:center;">暂无查询记录</div>';
             return;
         }
-        
+
         // 只显示最近的100条记录，避免DOM过多
         const displayResults = results.slice(-100);
-        
+
         queryListEl.innerHTML = displayResults.map((item, idx) => {
             const realIdx = results.length - displayResults.length + idx;
             const badgeClass = item.type === 'PSCJ' ? 'pscj' : 'qmcj';
             const typeLabel = item.type === 'PSCJ' ? '平时' : '期末';
             const rowCount = item.rows ? item.rows.length : 0;
-            
+
             return `
                 <div class="dev-query-item">
                     <div class="dev-query-header" onclick="this.nextElementSibling.classList.toggle('expanded')">
@@ -1387,13 +2541,1502 @@
             rows: rows,
             rawResponse: rawResponse
         };
-        
+
         scriptState.rawData.queryResults.push(result);
-        
+
         // 如果开发者模式开启，实时更新显示
         if (scriptState.devMode) {
             updateDevQueryDisplay();
         }
+    }
+
+    function updateDevProbeDisplay() {
+        if (!scriptState.container) return;
+
+        const probeDataEl = scriptState.container.querySelector('#dev-probe-data');
+        const downloadBtn = scriptState.container.querySelector('#dev-download-probe-results');
+
+        if (probeDataEl) {
+            probeDataEl.textContent = scriptState.rawData.probeResults
+                ? JSON.stringify(scriptState.rawData.probeResults, null, 2)
+                : '暂无数据';
+        }
+
+        if (downloadBtn) {
+            downloadBtn.disabled = !scriptState.rawData.probeResults;
+        }
+    }
+
+    function formatDateTimeForFilename(date) {
+        const pad = (value) => String(value).padStart(2, '0');
+        return [
+            date.getFullYear(),
+            pad(date.getMonth() + 1),
+            pad(date.getDate())
+        ].join('') + '-' + [
+            pad(date.getHours()),
+            pad(date.getMinutes()),
+            pad(date.getSeconds())
+        ].join('');
+    }
+
+    function downloadJsonFile(data, filename) {
+        const json = JSON.stringify(data, null, 2);
+        const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function startNetworkMonitor() {
+        installNetworkMonitor();
+        scriptState.networkMonitor.active = true;
+        updateDevNetworkStatus('监听中。请在官方成绩页面点击“详情”、切换标签或触发你想捕获的操作。');
+        updateDevNetworkDisplay();
+    }
+
+    function stopNetworkMonitor() {
+        scriptState.networkMonitor.active = false;
+        updateDevNetworkStatus(`已停止监听，当前记录 ${scriptState.rawData.networkCaptures.length} 条。`);
+        updateDevNetworkDisplay();
+    }
+
+    function installNetworkMonitor() {
+        if (scriptState.networkMonitor.installed) return;
+
+        const pageWindow = getPageWindow();
+        patchPageFetchForMonitor(pageWindow);
+        patchPageXHRForMonitor(pageWindow);
+        scriptState.networkMonitor.installed = true;
+    }
+
+    function patchPageFetchForMonitor(pageWindow) {
+        if (!pageWindow || typeof pageWindow.fetch !== 'function') return;
+
+        scriptState.networkMonitor.originalFetch = pageWindow.fetch;
+        const originalFetch = pageWindow.fetch.bind(pageWindow);
+
+        pageWindow.fetch = async function(input, init = {}) {
+            const requestInfo = normalizeFetchRequestInfo(input, init);
+            const started = Date.now();
+
+            try {
+                const response = await originalFetch(input, init);
+                captureFetchResponse(requestInfo, response, started);
+                return response;
+            } catch (err) {
+                recordNetworkCapture({
+                    transport: 'fetch',
+                    method: requestInfo.method,
+                    url: requestInfo.url,
+                    requestBody: requestInfo.body,
+                    status: null,
+                    networkError: true,
+                    error: String(err),
+                    durationMs: Date.now() - started,
+                    responseText: ''
+                });
+                throw err;
+            }
+        };
+    }
+
+    function patchPageXHRForMonitor(pageWindow) {
+        if (!pageWindow || !pageWindow.XMLHttpRequest) return;
+
+        const proto = pageWindow.XMLHttpRequest.prototype;
+        if (proto.__szuScoreMonitorPatched) return;
+
+        scriptState.networkMonitor.originalXHROpen = proto.open;
+        scriptState.networkMonitor.originalXHRSend = proto.send;
+
+        proto.open = function(method, url) {
+            this.__szuScoreMonitorInfo = {
+                method: method || 'GET',
+                url: normalizeSameOriginUrl(url) || String(url || ''),
+                started: null,
+                requestBody: ''
+            };
+            return scriptState.networkMonitor.originalXHROpen.apply(this, arguments);
+        };
+
+        proto.send = function(body) {
+            const info = this.__szuScoreMonitorInfo || {};
+            info.started = Date.now();
+            info.requestBody = typeof body === 'string' ? body : '';
+
+            this.addEventListener('loadend', () => {
+                const responseText = readXHRResponseText(this);
+                recordNetworkCapture({
+                    transport: 'XMLHttpRequest',
+                    method: info.method || 'GET',
+                    url: info.url || '',
+                    requestBody: info.requestBody || '',
+                    status: this.status || null,
+                    networkError: false,
+                    error: null,
+                    durationMs: Date.now() - (info.started || Date.now()),
+                    responseText
+                });
+            });
+
+            return scriptState.networkMonitor.originalXHRSend.apply(this, arguments);
+        };
+
+        proto.__szuScoreMonitorPatched = true;
+    }
+
+    function normalizeFetchRequestInfo(input, init) {
+        let url = '';
+        let method = 'GET';
+        let body = '';
+
+        if (typeof input === 'string') {
+            url = input;
+        } else if (input && input.url) {
+            url = input.url;
+            method = input.method || method;
+        }
+
+        if (init && init.method) {
+            method = init.method;
+        }
+
+        if (init && typeof init.body === 'string') {
+            body = init.body;
+        }
+
+        return {
+            url: normalizeSameOriginUrl(url) || String(url || ''),
+            method,
+            body
+        };
+    }
+
+    async function captureFetchResponse(requestInfo, response, started) {
+        if (!shouldCaptureNetworkUrl(requestInfo.url)) return;
+
+        let responseText = '';
+        try {
+            const clone = response.clone();
+            responseText = await clone.text();
+        } catch (err) {
+            responseText = `[response text unavailable: ${String(err)}]`;
+        }
+
+        recordNetworkCapture({
+            transport: 'fetch',
+            method: requestInfo.method,
+            url: requestInfo.url,
+            requestBody: requestInfo.body,
+            status: response.status || null,
+            networkError: false,
+            error: null,
+            durationMs: Date.now() - started,
+            responseText
+        });
+    }
+
+    function readXHRResponseText(xhr) {
+        try {
+            const responseType = xhr.responseType || '';
+            if (responseType === '' || responseType === 'text') {
+                return xhr.responseText || '';
+            }
+            return `[non-text responseType: ${responseType}]`;
+        } catch (err) {
+            return `[response text unavailable: ${String(err)}]`;
+        }
+    }
+
+    function recordNetworkCapture(capture) {
+        if (!scriptState.networkMonitor.active) return;
+        if (!shouldCaptureNetworkUrl(capture.url)) return;
+
+        const responseText = capture.responseText || '';
+        const item = {
+            timestamp: new Date().toISOString(),
+            transport: capture.transport,
+            method: capture.method,
+            url: safeUrlForReport(capture.url),
+            requestBody: capture.requestBody || '',
+            status: capture.status,
+            networkError: capture.networkError || false,
+            error: capture.error || null,
+            durationMs: capture.durationMs,
+            responseTextLength: responseText.length,
+            responseText,
+            summary: summarizeCapturedResponse(responseText)
+        };
+
+        scriptState.rawData.networkCaptures.push(item);
+        updateDevNetworkDisplay();
+    }
+
+    function shouldCaptureNetworkUrl(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            if (parsed.origin !== location.origin) return false;
+            return parsed.pathname.includes('/sys/cjcx/');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function summarizeCapturedResponse(responseText) {
+        if (!responseText) {
+            return { isJson: false, responseLength: 0, keys: [], rowCandidates: [] };
+        }
+
+        try {
+            const data = JSON.parse(responseText);
+            return {
+                isJson: true,
+                responseLength: responseText.length,
+                keys: data && typeof data === 'object' ? Object.keys(data).slice(0, 30) : [],
+                rowCandidates: collectRowCandidates(data).slice(0, 20),
+                coefficientLikeFields: collectCoefficientLikeFields(data).slice(0, 80)
+            };
+        } catch (err) {
+            return {
+                isJson: false,
+                responseLength: responseText.length,
+                textPreview: maskSensitiveText(responseText.slice(0, 800))
+            };
+        }
+    }
+
+    function updateDevNetworkDisplay() {
+        if (!scriptState.container) return;
+
+        const dataEl = scriptState.container.querySelector('#dev-network-data');
+        const countEl = scriptState.container.querySelector('#dev-network-count');
+        const downloadBtn = scriptState.container.querySelector('#dev-download-network-captures');
+        const startBtn = scriptState.container.querySelector('#dev-start-network-monitor');
+        const stopBtn = scriptState.container.querySelector('#dev-stop-network-monitor');
+        const captures = scriptState.rawData.networkCaptures;
+
+        if (countEl) countEl.textContent = captures.length;
+        if (downloadBtn) downloadBtn.disabled = captures.length === 0;
+        if (startBtn) startBtn.disabled = scriptState.networkMonitor.active;
+        if (stopBtn) stopBtn.disabled = !scriptState.networkMonitor.active;
+
+        if (dataEl) {
+            dataEl.textContent = captures.length
+                ? JSON.stringify(captures.slice(-30), null, 2)
+                : '暂无数据';
+        }
+    }
+
+    function updateDevNetworkStatus(message) {
+        if (!scriptState.container) return;
+        const statusEl = scriptState.container.querySelector('#dev-network-status');
+        if (statusEl) statusEl.textContent = message;
+    }
+
+    function buildNetworkCaptureExport() {
+        return {
+            timestamp: new Date().toISOString(),
+            meta: {
+                scriptVersion: '4.12-network-monitor',
+                origin: location.origin,
+                pathname: location.pathname,
+                pageTitle: document.title,
+                note: '页面请求监听结果；包含匹配 /sys/cjcx/ 的请求 body 和完整响应正文；不导出 Cookie、Token、Authorization。'
+            },
+            runtime: inspectPageRuntimeForOfficialProbe(),
+            captures: scriptState.rawData.networkCaptures
+        };
+    }
+
+    function dismissProbeNetworkErrorDialogs() {
+        try {
+            const candidates = Array.from(document.querySelectorAll('button, input[type="button"], [role="button"], .bh-btn, .jqx-button'));
+            for (const element of candidates) {
+                const text = (element.textContent || element.value || '').trim();
+                if (!/^(关闭|确定|OK)$/i.test(text)) continue;
+
+                if (hasNetworkErrorAncestor(element)) {
+                    element.click();
+                    return;
+                }
+            }
+
+            const closeCandidates = Array.from(document.querySelectorAll('[class*="close"], [aria-label*="关闭"], [title*="关闭"]'));
+            for (const element of closeCandidates) {
+                if (hasNetworkErrorAncestor(element)) {
+                    element.click();
+                    return;
+                }
+            }
+        } catch (err) {
+            console.warn('[深大成绩查询] 自动关闭网络错误弹窗失败:', err);
+        }
+    }
+
+    function hasNetworkErrorAncestor(element) {
+        let current = element;
+        let depth = 0;
+        while (current && depth < 8) {
+            const text = current.textContent || '';
+            if (text.includes('网络错误')) return true;
+            current = current.parentElement;
+            depth++;
+        }
+        return false;
+    }
+
+    async function runCoefficientEndpointProbe(updateStatus, onProgress) {
+        const startedAt = new Date();
+        const status = typeof updateStatus === 'function' ? updateStatus : () => {};
+        const notifyProgress = typeof onProgress === 'function' ? onProgress : () => {};
+        const report = {
+            timestamp: startedAt.toISOString(),
+            completedAt: null,
+            state: 'running',
+            meta: {
+                scriptVersion: '4.11-dev-probe',
+                origin: location.origin,
+                pathname: location.pathname,
+                pageTitle: document.title,
+                note: '结果用于定位新成绩系数接口；优先复刻官方 jxblrcjxs.do 和 BH_UTILS.doSyncAjax 调用；导出每个探测请求的完整响应正文 rawResponseText；不导出 Cookie、Token、Authorization。'
+            },
+            seedCourses: [],
+            discovery: {
+                resourcesScanned: [],
+                discoveredEndpoints: []
+            },
+            officialCoefficientProbe: null,
+            candidates: [],
+            payloadTemplates: [],
+            requestCount: 0,
+            maxRequests: 80,
+            promising: [],
+            requests: []
+        };
+        notifyProgress(report);
+
+        status('正在获取课程列表作为探测种子...');
+        const initialCourses = await ensureInitialCoursesForProbe();
+        const seedCourses = buildProbeCourseSeeds(initialCourses);
+        const primarySeed = seedCourses[0] || {};
+        report.seedCourses = seedCourses;
+        notifyProgress(report);
+
+        status('正在复刻官方教学班成绩系数接口调用...');
+        report.officialCoefficientProbe = await runOfficialCoefficientProbe(seedCourses, status, (partialProbe) => {
+            report.officialCoefficientProbe = partialProbe;
+            notifyProgress(report);
+        });
+        notifyProgress(report);
+
+        status('正在扫描当前页面和脚本资源，寻找候选接口...');
+        const discovery = await discoverCoefficientEndpointCandidates(status, (partialDiscovery) => {
+            report.discovery = partialDiscovery;
+            notifyProgress(report);
+        });
+        report.discovery = discovery;
+
+        const candidates = buildCoefficientProbeCandidates(discovery.discoveredEndpoints);
+        const payloadTemplates = buildCoefficientProbePayloads(primarySeed);
+        report.candidates = candidates.map(safeUrlForReport);
+        report.payloadTemplates = payloadTemplates.map(payload => ({
+            name: payload.name,
+            keys: payload.keys,
+            dataLength: payload.data.length
+        }));
+        notifyProgress(report);
+
+        let requestCount = 0;
+
+        for (const endpoint of candidates) {
+            const payloads = selectProbePayloadsForEndpoint(endpoint, payloadTemplates);
+
+            for (const payload of payloads) {
+                if (requestCount >= report.maxRequests) break;
+
+                requestCount++;
+                status(`正在探测接口 ${requestCount}/${report.maxRequests}：${shortEndpointName(endpoint)} / ${payload.name}`);
+
+                const response = await gmProbeRequest({
+                    method: 'POST',
+                    url: endpoint,
+                    data: payload.data,
+                    timeout: 6000
+                });
+                dismissProbeNetworkErrorDialogs();
+
+                const summary = summarizeProbeHttpResponse(response);
+                const result = {
+                    index: requestCount,
+                    endpoint: safeUrlForReport(endpoint),
+                    method: 'POST',
+                    payloadName: payload.name,
+                    payloadKeys: payload.keys,
+                    status: response.status || null,
+                    durationMs: response.durationMs,
+                    networkError: response.networkError || false,
+                    error: response.error || null,
+                    finalUrl: response.finalUrl ? safeUrlForReport(response.finalUrl) : null,
+                    requestPayload: payload.data,
+                    rawResponseTextLength: response.responseText ? response.responseText.length : 0,
+                    rawResponseText: response.responseText || '',
+                    summary
+                };
+                result.match = scoreProbeResult(result);
+                report.requests.push(result);
+                report.requestCount = requestCount;
+                refreshProbePromising(report);
+                notifyProgress(report);
+
+                await sleep(80);
+            }
+
+            if (requestCount >= report.maxRequests) break;
+        }
+
+        report.state = 'completed';
+        report.completedAt = new Date().toISOString();
+        refreshProbePromising(report);
+        notifyProgress(report);
+        return report;
+    }
+
+    async function ensureInitialCoursesForProbe() {
+        const cachedRows = scriptState.rawData.initialCourses?.datas?.xscjcx?.rows;
+        if (Array.isArray(cachedRows) && cachedRows.length > 0) {
+            return cachedRows;
+        }
+
+        const rows = await fetchInitialCourseList();
+        return Array.isArray(rows) ? rows : [];
+    }
+
+    function buildProbeCourseSeeds(courses) {
+        if (!Array.isArray(courses)) return [];
+
+        const seedFields = [
+            'JXBID', 'XNXQDM', 'XNXQDM_DISPLAY', 'KCH', 'KCDM', 'KCM',
+            'KXH', 'KKDWDM', 'KCXZDM', 'KCLBDM', 'XF'
+        ];
+
+        return courses.slice(0, 3).map((course, index) => {
+            const seed = { index };
+            seedFields.forEach(field => {
+                if (course && course[field] !== undefined && course[field] !== null) {
+                    seed[field] = String(course[field]);
+                }
+            });
+            return seed;
+        });
+    }
+
+    async function runOfficialCoefficientProbe(seedCourses, updateStatus, onProgress) {
+        const status = typeof updateStatus === 'function' ? updateStatus : () => {};
+        const notifyProgress = typeof onProgress === 'function' ? onProgress : () => {};
+        const courses = (seedCourses || [])
+            .filter(course => course && course.JXBID)
+            .slice(0, 5);
+        const endpoints = buildOfficialCoefficientEndpointUrls();
+        const transports = buildOfficialCoefficientTransports();
+        const probe = {
+            state: courses.length > 0 ? 'running' : 'skipped',
+            reason: courses.length > 0 ? null : '没有可用于探测的 JXBID',
+            endpointPurpose: '官方前端 getJxbLrcjxs({JXBID: jxbid, XSYC: 0})',
+            expectedShape: 'datas.jxblrcjxs.rows[0]，行内以 XS 结尾的数字字段为成绩项系数',
+            runtime: inspectPageRuntimeForOfficialProbe(),
+            courseCount: courses.length,
+            endpoints: endpoints.map(safeUrlForReport),
+            transports: transports.map(transport => transport.name),
+            requestCount: 0,
+            successCount: 0,
+            coefficientHits: [],
+            requests: []
+        };
+        notifyProgress(probe);
+
+        if (courses.length === 0) {
+            return probe;
+        }
+
+        const totalRequests = courses.length * endpoints.length * transports.length;
+
+        for (const course of courses) {
+            const payloadData = { JXBID: course.JXBID, XSYC: '0' };
+            const payload = encodeFormData(payloadData);
+
+            for (const endpoint of endpoints) {
+                for (const transport of transports) {
+                    probe.requestCount++;
+                    status(`官方系数接口专项探测 ${probe.requestCount}/${totalRequests}：${transport.name} / ${shortEndpointName(endpoint)} / ${course.KCM || course.JXBID}`);
+
+                    const response = await transport.request({
+                        method: 'POST',
+                        url: endpoint,
+                        data: payload,
+                        dataObject: payloadData,
+                        timeout: 10000
+                    });
+                    dismissProbeNetworkErrorDialogs();
+                    const summary = summarizeProbeHttpResponse(response);
+                    const parsed = parseOfficialCoefficientResponse(response);
+                    const result = {
+                        index: probe.requestCount,
+                        transport: transport.name,
+                        endpoint: safeUrlForReport(endpoint),
+                        method: 'POST',
+                        course: {
+                            index: course.index,
+                            JXBID: course.JXBID,
+                            KCM: course.KCM || '',
+                            KCH: course.KCH || course.KCDM || '',
+                            XNXQDM: course.XNXQDM || ''
+                        },
+                        requestPayload: payload,
+                        status: response.status || null,
+                        durationMs: response.durationMs,
+                        networkError: response.networkError || false,
+                        error: response.error || null,
+                        finalUrl: response.finalUrl ? safeUrlForReport(response.finalUrl) : null,
+                        rawResponseTextLength: response.responseText ? response.responseText.length : 0,
+                        rawResponseText: response.responseText || '',
+                        summary,
+                        parsed
+                    };
+                    result.match = scoreOfficialCoefficientProbeResult(result);
+                    probe.requests.push(result);
+
+                    if (parsed.coefficientFields.length > 0) {
+                        probe.successCount++;
+                        probe.coefficientHits.push({
+                            index: result.index,
+                            transport: result.transport,
+                            endpoint: result.endpoint,
+                            course: result.course,
+                            coefficientFields: parsed.coefficientFields
+                        });
+                    }
+
+                    notifyProgress(probe);
+                    await sleep(120);
+                }
+            }
+        }
+
+        probe.state = 'completed';
+        notifyProgress(probe);
+        return probe;
+    }
+
+    function buildOfficialCoefficientEndpointUrls() {
+        const urls = new Set();
+        const appModulePath = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/jxblrcjxs.do`;
+        const defaultModulePath = `${location.origin}/jwapp/sys/cjcx/*default/modules/cjcx/jxblrcjxs.do`;
+        urls.add(appModulePath);
+        urls.add(defaultModulePath);
+
+        try {
+            const pageWindow = getPageWindow();
+            const absPath = pageWindow?.WIS_EMAP_SERV?.getAbsPath?.('/modules/cjcx/jxblrcjxs.do');
+            if (absPath) {
+                urls.add(new URL(absPath, location.href).toString());
+            }
+        } catch (e) {
+            console.warn('[深大成绩查询] 读取 WIS_EMAP_SERV.getAbsPath 失败:', e);
+        }
+
+        try {
+            const pageWindow = getPageWindow();
+            const modulePath = pageWindow?.APP_CONFIG?.MODULE_PATH;
+            if (modulePath) {
+                urls.add(new URL('cjcx/jxblrcjxs.do', modulePath).toString());
+            }
+        } catch (e) {
+            console.warn('[深大成绩查询] 读取 APP_CONFIG.MODULE_PATH 失败:', e);
+        }
+
+        return Array.from(urls)
+            .map(url => normalizeSameOriginUrl(url))
+            .filter(Boolean)
+            .filter((url, index, arr) => arr.indexOf(url) === index);
+    }
+
+    function buildOfficialCoefficientTransports() {
+        return [
+            { name: 'page-BH_UTILS-doSyncAjax', request: bhDoSyncAjaxProbeRequest },
+            { name: 'GM_xmlhttpRequest', request: gmProbeRequest },
+            { name: 'page-fetch', request: pageFetchProbeRequest },
+            { name: 'page-jquery-ajax', request: jqueryAjaxProbeRequest }
+        ];
+    }
+
+    function getPageWindow() {
+        if (typeof unsafeWindow !== 'undefined') {
+            return unsafeWindow;
+        }
+        return window;
+    }
+
+    function inspectPageRuntimeForOfficialProbe() {
+        const info = {
+            hasUnsafeWindow: typeof unsafeWindow !== 'undefined',
+            hasBH_UTILS: false,
+            hasBHDoSyncAjax: false,
+            hasWIS_EMAP_SERV: false,
+            hasWISGetAbsPath: false,
+            wisAbsPathSample: null,
+            hasAPP_CONFIG: false,
+            appModulePath: null,
+            hasJQuery: false,
+            hasFetch: false,
+            hasRequire: false
+        };
+
+        try {
+            const pageWindow = getPageWindow();
+            info.hasBH_UTILS = !!pageWindow?.BH_UTILS;
+            info.hasBHDoSyncAjax = typeof pageWindow?.BH_UTILS?.doSyncAjax === 'function';
+            info.hasWIS_EMAP_SERV = !!pageWindow?.WIS_EMAP_SERV;
+            info.hasWISGetAbsPath = typeof pageWindow?.WIS_EMAP_SERV?.getAbsPath === 'function';
+            if (info.hasWISGetAbsPath) {
+                info.wisAbsPathSample = String(pageWindow.WIS_EMAP_SERV.getAbsPath('/modules/cjcx/jxblrcjxs.do'));
+            }
+            info.hasAPP_CONFIG = !!pageWindow?.APP_CONFIG;
+            info.appModulePath = pageWindow?.APP_CONFIG?.MODULE_PATH ? String(pageWindow.APP_CONFIG.MODULE_PATH) : null;
+            info.hasJQuery = !!(pageWindow?.jQuery || pageWindow?.$);
+            info.hasFetch = typeof pageWindow?.fetch === 'function';
+            info.hasRequire = typeof pageWindow?.require === 'function';
+        } catch (err) {
+            info.error = String(err);
+        }
+
+        return info;
+    }
+
+    function bhDoSyncAjaxProbeRequest(options) {
+        const started = Date.now();
+
+        try {
+            const pageWindow = getPageWindow();
+            const bhUtils = pageWindow?.BH_UTILS;
+            if (!bhUtils || typeof bhUtils.doSyncAjax !== 'function') {
+                return Promise.resolve({
+                    networkError: true,
+                    error: 'BH_UTILS.doSyncAjax unavailable',
+                    responseText: '',
+                    durationMs: Date.now() - started
+                });
+            }
+
+            const params = options.dataObject || decodeFormData(options.data || '');
+            const response = bhUtils.doSyncAjax(options.url, params);
+            const responseText = response === undefined
+                ? ''
+                : typeof response === 'string'
+                ? response
+                : JSON.stringify(response);
+
+            return Promise.resolve({
+                status: 200,
+                responseText,
+                responseHeaders: '',
+                finalUrl: options.url,
+                durationMs: Date.now() - started,
+                syntheticTransport: true
+            });
+        } catch (err) {
+            return Promise.resolve({
+                networkError: true,
+                error: String(err),
+                responseText: '',
+                durationMs: Date.now() - started
+            });
+        }
+    }
+
+    async function pageFetchProbeRequest(options) {
+        const started = Date.now();
+        const method = options.method || 'GET';
+        const headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest'
+        };
+
+        if (method.toUpperCase() === 'POST') {
+            headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+        }
+
+        try {
+            const pageWindow = getPageWindow();
+            const fetchImpl = pageWindow.fetch ? pageWindow.fetch.bind(pageWindow) : fetch.bind(window);
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), options.timeout || 10000);
+            const response = await fetchImpl(options.url, {
+                method,
+                headers,
+                body: options.data || undefined,
+                credentials: 'same-origin',
+                cache: 'no-store',
+                signal: controller.signal
+            });
+            clearTimeout(timer);
+
+            const responseText = await response.text();
+            const responseHeaders = [];
+            response.headers.forEach((value, key) => {
+                responseHeaders.push(`${key}: ${value}`);
+            });
+
+            return {
+                status: response.status,
+                responseText,
+                responseHeaders: responseHeaders.join('\n'),
+                finalUrl: response.url || options.url,
+                durationMs: Date.now() - started
+            };
+        } catch (err) {
+            return {
+                networkError: true,
+                error: err && err.name === 'AbortError' ? 'timeout' : String(err),
+                responseText: '',
+                durationMs: Date.now() - started
+            };
+        }
+    }
+
+    function jqueryAjaxProbeRequest(options) {
+        const started = Date.now();
+        const method = options.method || 'GET';
+        const headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest'
+        };
+
+        return new Promise(resolve => {
+            try {
+                const pageWindow = getPageWindow();
+                const jq = pageWindow.jQuery || pageWindow.$;
+                if (!jq || typeof jq.ajax !== 'function') {
+                    resolve({
+                        networkError: true,
+                        error: 'jQuery ajax unavailable',
+                        responseText: '',
+                        durationMs: Date.now() - started
+                    });
+                    return;
+                }
+
+                jq.ajax({
+                    url: options.url,
+                    type: method,
+                    method,
+                    data: options.data || undefined,
+                    dataType: 'text',
+                    contentType: method.toUpperCase() === 'POST'
+                        ? 'application/x-www-form-urlencoded;charset=UTF-8'
+                        : undefined,
+                    headers,
+                    timeout: options.timeout || 10000,
+                    xhrFields: { withCredentials: true }
+                }).done((data, textStatus, jqXHR) => {
+                    resolve({
+                        status: jqXHR?.status || 200,
+                        responseText: typeof data === 'string' ? data : JSON.stringify(data),
+                        responseHeaders: jqXHR?.getAllResponseHeaders?.() || '',
+                        finalUrl: options.url,
+                        durationMs: Date.now() - started
+                    });
+                }).fail((jqXHR, textStatus, errorThrown) => {
+                    resolve({
+                        status: jqXHR?.status || null,
+                        networkError: true,
+                        error: errorThrown || textStatus || 'ajax failed',
+                        responseText: jqXHR?.responseText || '',
+                        responseHeaders: jqXHR?.getAllResponseHeaders?.() || '',
+                        finalUrl: options.url,
+                        durationMs: Date.now() - started
+                    });
+                });
+            } catch (err) {
+                resolve({
+                    networkError: true,
+                    error: String(err),
+                    responseText: '',
+                    durationMs: Date.now() - started
+                });
+            }
+        });
+    }
+
+    function parseOfficialCoefficientResponse(response) {
+        const result = {
+            isJson: false,
+            isOfficialShape: false,
+            extCode: null,
+            extMsg: null,
+            rowCount: 0,
+            rowKeys: [],
+            coefficientFields: []
+        };
+
+        try {
+            const data = JSON.parse(response.responseText || '');
+            result.isJson = true;
+            const table = data?.datas?.jxblrcjxs;
+            if (!table) return result;
+
+            result.isOfficialShape = true;
+            result.extCode = table.extParams?.code ?? null;
+            result.extMsg = table.extParams?.msg ?? null;
+            const rows = Array.isArray(table.rows) ? table.rows : [];
+            result.rowCount = rows.length;
+            result.rowKeys = rows[0] ? Object.keys(rows[0]) : [];
+            result.coefficientFields = rows.flatMap((row, rowIndex) =>
+                extractOfficialCoefficientFields(row).map(field => ({
+                    rowIndex,
+                    ...field
+                }))
+            );
+        } catch (e) {
+            result.parseError = e.message;
+        }
+
+        return result;
+    }
+
+    function extractOfficialCoefficientFields(row) {
+        if (!row || typeof row !== 'object') return [];
+
+        return Object.keys(row)
+            .filter(key => /^(PSCJ|QZCJ|QMCJ|SYCJ|SJCJ|QTCJ\d+)XS$/i.test(key))
+            .filter(key => row[key] !== null && row[key] !== undefined && row[key] !== '' && !isNaN(parseFloat(row[key])))
+            .map(key => ({
+                key,
+                scoreItem: key.replace(/XS$/i, ''),
+                value: parseFloat(row[key])
+            }));
+    }
+
+    function scoreOfficialCoefficientProbeResult(result) {
+        const reasons = [];
+        let score = 0;
+
+        if (result.status === 200) {
+            score += 1;
+            reasons.push('HTTP 200');
+        }
+
+        if (result.parsed.isOfficialShape) {
+            score += 3;
+            reasons.push('官方 jxblrcjxs 结构');
+        }
+
+        if (result.parsed.rowCount > 0) {
+            score += 2;
+            reasons.push('返回教学班系数行');
+        }
+
+        if (result.parsed.coefficientFields.length > 0) {
+            score += 8;
+            reasons.push('发现官方 *XS 系数字段');
+        }
+
+        return { score, reasons };
+    }
+
+    async function discoverCoefficientEndpointCandidates(updateStatus, onProgress) {
+        const resources = collectProbeResourceUrls();
+        const discovered = new Set();
+        const scans = [];
+        const notifyProgress = typeof onProgress === 'function' ? onProgress : () => {};
+
+        for (let i = 0; i < resources.length; i++) {
+            const resourceUrl = resources[i];
+            updateStatus(`正在扫描资源 ${i + 1}/${resources.length}：${shortEndpointName(resourceUrl)}`);
+
+            const response = await gmProbeRequest({
+                method: 'GET',
+                url: resourceUrl,
+                timeout: 6000
+            });
+
+            const endpoints = response.responseText
+                ? extractEndpointCandidates(response.responseText).slice(0, 80)
+                : [];
+
+            endpoints.forEach(endpoint => discovered.add(endpoint));
+            scans.push({
+                url: safeUrlForReport(resourceUrl),
+                status: response.status || null,
+                durationMs: response.durationMs,
+                responseLength: response.responseText ? response.responseText.length : 0,
+                endpointsFound: endpoints.map(safeUrlForReport),
+                rawResponseText: response.responseText || ''
+            });
+            notifyProgress({
+                resourcesScanned: scans,
+                discoveredEndpoints: Array.from(discovered)
+            });
+
+            await sleep(60);
+        }
+
+        return {
+            resourcesScanned: scans,
+            discoveredEndpoints: Array.from(discovered)
+        };
+    }
+
+    function refreshProbePromising(report) {
+        report.promising = report.requests
+            .filter(item => item.match && item.match.score > 0)
+            .sort((a, b) => b.match.score - a.match.score)
+            .slice(0, 20);
+    }
+
+    function collectProbeResourceUrls() {
+        const urls = new Set();
+        urls.add(location.origin + location.pathname);
+
+        Array.from(document.scripts || []).forEach(script => {
+            if (script.src) urls.add(script.src);
+        });
+
+        if (window.performance && typeof window.performance.getEntriesByType === 'function') {
+            performance.getEntriesByType('resource').forEach(entry => {
+                if (entry && entry.name) urls.add(entry.name);
+            });
+        }
+
+        return Array.from(urls)
+            .map(url => normalizeSameOriginUrl(url))
+            .filter(Boolean)
+            .filter(url => {
+                try {
+                    const parsed = new URL(url);
+                    const path = parsed.pathname.toLowerCase();
+                    return path.includes('/jwapp/sys/cjcx') || path.endsWith('.js');
+                } catch (e) {
+                    return false;
+                }
+            })
+            .filter((url, index, arr) => arr.indexOf(url) === index)
+            .slice(0, 18);
+    }
+
+    function extractEndpointCandidates(text) {
+        const endpoints = new Set();
+        const source = String(text || '')
+            .replace(/\\u002F/g, '/')
+            .replace(/\\\//g, '/')
+            .slice(0, 300000);
+
+        const patterns = [
+            /\/jwapp\/sys\/cjcx\/[A-Za-z0-9_./-]+\.do/g,
+            /modules\/cjcx\/[A-Za-z0-9_./-]+\.do/g,
+            /["'`]([A-Za-z0-9_./-]*(?:cjcx|xscj|jxbl|jxb|cjxs|cjbl)[A-Za-z0-9_./-]*\.do)["'`]/gi
+        ];
+
+        patterns.forEach(pattern => {
+            let match;
+            while ((match = pattern.exec(source)) !== null) {
+                const raw = match[1] || match[0];
+                const normalized = normalizeEndpointCandidate(raw);
+                if (normalized) endpoints.add(normalized);
+            }
+        });
+
+        return Array.from(endpoints);
+    }
+
+    function buildCoefficientProbeCandidates(discoveredEndpoints) {
+        const hardcoded = getDefaultCoefficientProbeEndpoints();
+        const ordered = [
+            ...Array.from(discoveredEndpoints || []),
+            ...hardcoded
+        ];
+
+        return ordered
+            .map(endpoint => normalizeEndpointCandidate(endpoint))
+            .filter(Boolean)
+            .filter((endpoint, index, arr) => arr.indexOf(endpoint) === index)
+            .slice(0, 30);
+    }
+
+    function getDefaultCoefficientProbeEndpoints() {
+        const base = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/`;
+        return [
+            'jxblrcjxs.do',
+            'xscjcx.do',
+            'xscjcxmx.do',
+            'xscjmx.do',
+            'cjcxmx.do',
+            'cjmx.do',
+            'cjjg.do',
+            'cjxx.do',
+            'cjxs.do',
+            'cjxsxx.do',
+            'xscjxs.do',
+            'xscjbl.do',
+            'cjbl.do',
+            'jxcjxs.do',
+            'jxblxs.do',
+            'jxblxx.do',
+            'jxblrcjxsck.do',
+            'kcjxcjxs.do',
+            'xskccjmx.do',
+            'kccjmx.do',
+            'jxbxx.do'
+        ].map(name => base + name);
+    }
+
+    function buildCoefficientProbePayloads(seed) {
+        const payloads = [];
+        const jxbid = seed?.JXBID || '';
+        const xnxqdm = seed?.XNXQDM || '';
+        const kch = seed?.KCH || seed?.KCDM || '';
+
+        if (jxbid) {
+            payloads.push({
+                name: 'jxbid-xsyc',
+                keys: ['JXBID', 'XSYC'],
+                data: encodeFormData({ JXBID: jxbid, XSYC: '0' })
+            });
+            payloads.push({
+                name: 'jxbid-only',
+                keys: ['JXBID'],
+                data: encodeFormData({ JXBID: jxbid })
+            });
+            payloads.push({
+                name: 'query-jxbid',
+                keys: ['querySetting', 'pageSize', 'pageNumber'],
+                data: buildQuerySettingPayload([{ name: 'JXBID', value: jxbid, linkOpt: 'and', builder: 'equal' }])
+            });
+        }
+
+        if (jxbid && xnxqdm) {
+            payloads.push({
+                name: 'query-jxbid-xnxq',
+                keys: ['querySetting', 'pageSize', 'pageNumber'],
+                data: buildQuerySettingPayload([
+                    { name: 'JXBID', value: jxbid, linkOpt: 'and', builder: 'equal' },
+                    { name: 'XNXQDM', value: xnxqdm, linkOpt: 'and', builder: 'equal' }
+                ])
+            });
+            payloads.push({
+                name: 'jxbid-xnxqdm',
+                keys: ['JXBID', 'XNXQDM'],
+                data: encodeFormData({ JXBID: jxbid, XNXQDM: xnxqdm })
+            });
+        }
+
+        if (kch && xnxqdm) {
+            payloads.push({
+                name: 'query-kch-xnxq',
+                keys: ['querySetting', 'pageSize', 'pageNumber'],
+                data: buildQuerySettingPayload([
+                    { name: 'KCH', value: kch, linkOpt: 'and', builder: 'equal' },
+                    { name: 'XNXQDM', value: xnxqdm, linkOpt: 'and', builder: 'equal' }
+                ])
+            });
+        }
+
+        payloads.push({
+            name: 'page-list',
+            keys: ['pageSize', 'pageNumber'],
+            data: encodeFormData({ pageSize: '20', pageNumber: '1' })
+        });
+
+        return payloads;
+    }
+
+    function selectProbePayloadsForEndpoint(endpoint, payloadTemplates) {
+        if (!payloadTemplates || payloadTemplates.length === 0) return [];
+
+        const lowerEndpoint = endpoint.toLowerCase();
+        const preferredNames = lowerEndpoint.includes('xscjcx.do')
+            ? ['page-list', 'query-jxbid', 'query-jxbid-xnxq', 'query-kch-xnxq']
+            : ['jxbid-xsyc', 'jxbid-only', 'query-jxbid', 'query-jxbid-xnxq'];
+
+        const selected = preferredNames
+            .map(name => payloadTemplates.find(payload => payload.name === name))
+            .filter(Boolean);
+
+        if (selected.length > 0) {
+            return selected.slice(0, 4);
+        }
+
+        return payloadTemplates.slice(0, 3);
+    }
+
+    function buildQuerySettingPayload(settings) {
+        return encodeFormData({
+            querySetting: JSON.stringify(settings),
+            pageSize: '20',
+            pageNumber: '1'
+        });
+    }
+
+    function encodeFormData(data) {
+        return Object.keys(data)
+            .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`)
+            .join('&');
+    }
+
+    function decodeFormData(formText) {
+        const result = {};
+        String(formText || '').split('&').forEach(pair => {
+            if (!pair) return;
+            const parts = pair.split('=');
+            const key = decodeURIComponent(parts[0] || '');
+            const value = decodeURIComponent(parts.slice(1).join('=') || '');
+            if (key) result[key] = value;
+        });
+        return result;
+    }
+
+    function gmProbeRequest(options) {
+        const started = Date.now();
+        const method = options.method || 'GET';
+        const headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest'
+        };
+
+        if (method.toUpperCase() === 'POST') {
+            headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+        }
+
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method,
+                url: options.url,
+                headers,
+                data: options.data || undefined,
+                anonymous: false,
+                timeout: options.timeout || 6000,
+                onload: res => {
+                    resolve({
+                        status: res.status,
+                        responseText: res.responseText || '',
+                        responseHeaders: res.responseHeaders || '',
+                        finalUrl: res.finalUrl || options.url,
+                        durationMs: Date.now() - started
+                    });
+                },
+                onerror: err => {
+                    resolve({
+                        networkError: true,
+                        error: String(err),
+                        responseText: '',
+                        durationMs: Date.now() - started
+                    });
+                },
+                ontimeout: () => {
+                    resolve({
+                        networkError: true,
+                        error: 'timeout',
+                        responseText: '',
+                        durationMs: Date.now() - started
+                    });
+                }
+            });
+        });
+    }
+
+    function summarizeProbeHttpResponse(response) {
+        const text = response.responseText || '';
+        const summary = {
+            responseLength: text.length,
+            contentType: getHeaderValue(response.responseHeaders, 'content-type'),
+            isJson: false,
+            jsonShape: null,
+            rowCandidates: [],
+            coefficientLikeFields: [],
+            textPreview: null
+        };
+
+        if (!text) return summary;
+
+        try {
+            const parsed = JSON.parse(text);
+            summary.isJson = true;
+            summary.jsonShape = buildJsonShape(parsed, 0, 4);
+            summary.rowCandidates = collectRowCandidates(parsed).slice(0, 20);
+            summary.coefficientLikeFields = collectCoefficientLikeFields(parsed).slice(0, 80);
+        } catch (e) {
+            summary.textPreview = maskSensitiveText(text.slice(0, 800));
+        }
+
+        return summary;
+    }
+
+    function buildJsonShape(value, depth, maxDepth) {
+        const type = getValueType(value);
+
+        if (depth >= maxDepth || value === null || type !== 'object') {
+            if (Array.isArray(value)) {
+                return {
+                    type: 'array',
+                    length: value.length,
+                    sample: value.length > 0 ? buildJsonShape(value[0], depth + 1, maxDepth) : null
+                };
+            }
+            return { type };
+        }
+
+        if (Array.isArray(value)) {
+            return {
+                type: 'array',
+                length: value.length,
+                sample: value.length > 0 ? buildJsonShape(value[0], depth + 1, maxDepth) : null
+            };
+        }
+
+        const keys = Object.keys(value);
+        const shape = {
+            type: 'object',
+            keys: keys.slice(0, 40),
+            children: {}
+        };
+
+        keys.slice(0, 20).forEach(key => {
+            shape.children[key] = buildJsonShape(value[key], depth + 1, maxDepth);
+        });
+
+        if (keys.length > 20) {
+            shape.omittedKeyCount = keys.length - 20;
+        }
+
+        return shape;
+    }
+
+    function collectRowCandidates(value, path = '$', results = [], depth = 0) {
+        if (results.length >= 50 || depth > 8 || value === null || value === undefined) {
+            return results;
+        }
+
+        if (Array.isArray(value)) {
+            const firstObject = value.find(item => item && typeof item === 'object' && !Array.isArray(item));
+            if (firstObject) {
+                const sampleKeys = Object.keys(firstObject);
+                results.push({
+                    path,
+                    length: value.length,
+                    sampleKeys,
+                    coefficientLikeFields: extractCoefficientFieldsFromObject(firstObject, path)
+                });
+            }
+
+            value.slice(0, 2).forEach((item, index) => {
+                collectRowCandidates(item, `${path}[${index}]`, results, depth + 1);
+            });
+            return results;
+        }
+
+        if (typeof value === 'object') {
+            Object.keys(value).slice(0, 30).forEach(key => {
+                collectRowCandidates(value[key], `${path}.${key}`, results, depth + 1);
+            });
+        }
+
+        return results;
+    }
+
+    function collectCoefficientLikeFields(value, path = '$', results = [], depth = 0) {
+        if (results.length >= 120 || depth > 8 || value === null || value === undefined) {
+            return results;
+        }
+
+        if (Array.isArray(value)) {
+            value.slice(0, 3).forEach((item, index) => {
+                collectCoefficientLikeFields(item, `${path}[${index}]`, results, depth + 1);
+            });
+            return results;
+        }
+
+        if (typeof value === 'object') {
+            Object.keys(value).slice(0, 50).forEach(key => {
+                const childPath = `${path}.${key}`;
+                const childValue = value[key];
+                if (isCoefficientLikeKey(key) && isPrimitiveValue(childValue)) {
+                    results.push({
+                        path: childPath,
+                        key,
+                        value: maskSensitiveValue(key, childValue)
+                    });
+                }
+                collectCoefficientLikeFields(childValue, childPath, results, depth + 1);
+            });
+        }
+
+        return results;
+    }
+
+    function extractCoefficientFieldsFromObject(obj, basePath) {
+        if (!obj || typeof obj !== 'object') return [];
+
+        return Object.keys(obj)
+            .filter(key => isCoefficientLikeKey(key) && isPrimitiveValue(obj[key]))
+            .map(key => ({
+                path: `${basePath}[].${key}`,
+                key,
+                value: maskSensitiveValue(key, obj[key])
+            }));
+    }
+
+    function scoreProbeResult(result) {
+        const reasons = [];
+        let score = 0;
+
+        if (result.status === 200) {
+            score += 1;
+            reasons.push('HTTP 200');
+        }
+
+        if (result.summary.isJson) {
+            score += 1;
+            reasons.push('JSON响应');
+        }
+
+        if (result.summary.rowCandidates.length > 0) {
+            score += 1;
+            reasons.push('包含数组行结构');
+        }
+
+        if (result.summary.coefficientLikeFields.length > 0) {
+            score += 5;
+            reasons.push('发现疑似系数字段');
+        }
+
+        if (result.summary.rowCandidates.some(row => row.coefficientLikeFields.length > 0)) {
+            score += 3;
+            reasons.push('行结构内发现疑似系数字段');
+        }
+
+        return { score, reasons };
+    }
+
+    function isCoefficientLikeKey(key) {
+        return /^(PSCJ|QZCJ|QMCJ|SYCJ|SJCJ|QTCJ\d+)XS$/i.test(key)
+            || /(PSCJXS|QMCJXS|PSCJBL|QMCJBL|CJXS|CJBL|CJQZ|QZ|BL|BILI|BILV|比例|系数|WEIGHT|RATE|PERCENT)/i.test(key);
+    }
+
+    function isSensitiveKey(key) {
+        return /^(XH|XM|SFZH|ZJHM|SJHM|LXDH|PHONE|MOBILE|TEL|EMAIL|COOKIE|SESSION|TOKEN|TICKET|AUTH|PASSWORD|PASS|SECRET|YHM|USERNAME|USERCODE)$/i.test(key);
+    }
+
+    function isPrimitiveValue(value) {
+        return value === null || ['string', 'number', 'boolean'].includes(typeof value);
+    }
+
+    function maskSensitiveValue(key, value) {
+        if (isSensitiveKey(key)) return '[REDACTED]';
+        if (typeof value === 'string' && value.length > 120) {
+            return value.slice(0, 120) + '...[truncated]';
+        }
+        return value;
+    }
+
+    function maskSensitiveText(text) {
+        return String(text || '')
+            .replace(/(token|ticket|session|password|authorization|cookie)=([^&\s"']+)/ig, '$1=[REDACTED]')
+            .replace(/("?(?:XH|XM|SFZH|ZJHM|SJHM|TOKEN|TICKET|SESSION|PASSWORD|AUTH)"?\s*[:=]\s*)("[^"]+"|'[^']+'|[^,\s}]+)/ig, '$1[REDACTED]');
+    }
+
+    function getValueType(value) {
+        if (Array.isArray(value)) return 'array';
+        if (value === null) return 'null';
+        return typeof value;
+    }
+
+    function getHeaderValue(headers, name) {
+        if (!headers) return null;
+
+        const target = name.toLowerCase();
+        const line = String(headers)
+            .split(/\r?\n/)
+            .find(item => item.toLowerCase().startsWith(target + ':'));
+
+        return line ? line.slice(line.indexOf(':') + 1).trim() : null;
+    }
+
+    function normalizeSameOriginUrl(rawUrl) {
+        try {
+            const parsed = new URL(rawUrl, location.href);
+            if (parsed.origin !== location.origin) return null;
+            parsed.hash = '';
+            parsed.search = '';
+            return parsed.toString();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function normalizeEndpointCandidate(rawEndpoint) {
+        if (!rawEndpoint) return null;
+
+        let endpoint = String(rawEndpoint)
+            .replace(/\\u002F/g, '/')
+            .replace(/\\\//g, '/')
+            .split('?')[0]
+            .split('#')[0]
+            .trim();
+
+        if (!endpoint || !endpoint.endsWith('.do')) return null;
+
+        if (endpoint.includes('modules/cjcx/')) {
+            endpoint = endpoint.slice(endpoint.indexOf('modules/cjcx/'));
+        }
+
+        let url;
+        if (/^https?:\/\//i.test(endpoint)) {
+            url = endpoint;
+        } else if (endpoint.startsWith('/')) {
+            url = location.origin + endpoint;
+        } else if (endpoint.startsWith('modules/cjcx/')) {
+            url = `${location.origin}/jwapp/sys/cjcx/${endpoint}`;
+        } else {
+            const filename = endpoint.split('/').pop();
+            url = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/${filename}`;
+        }
+
+        try {
+            const parsed = new URL(url);
+            if (parsed.origin !== location.origin) return null;
+            if (!parsed.pathname.includes('/jwapp/sys/cjcx/')) return null;
+            return parsed.origin + parsed.pathname;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function safeUrlForReport(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            return parsed.origin + parsed.pathname;
+        } catch (e) {
+            return String(url || '');
+        }
+    }
+
+    function shortEndpointName(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            const parts = parsed.pathname.split('/').filter(Boolean);
+            return parts.slice(-2).join('/');
+        } catch (e) {
+            return String(url || '').slice(-60);
+        }
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     toggleBtn.addEventListener('click', () => scriptState.container.classList.toggle('hidden'));
@@ -1611,6 +4254,7 @@
     }
 
     initContainer();
+    installInlineScoreTab();
     
     // 注册菜单命令
     GM_registerMenuCommand("打开深大成绩查询", () => {
