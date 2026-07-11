@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         深圳大学平时成绩&期末成绩查询
 // @namespace    http://tampermonkey.net/
-// @version      4.19
-// @description  开发者模式监听页面真实请求，支持页面内表格展示
+// @version      4.20
+// @description  支持成绩与系数分层轮询、数学模型回退及页面内表格展示
 // @author       流年.
 // @match        https://ehall.szu.edu.cn/jwapp/sys/cjcx/*
 // @match        https://ehall-443.webvpn.szu.edu.cn/jwapp/sys/cjcx/*
@@ -1085,26 +1085,24 @@
                     return;
                 }
 
-                // 2. 优先获取课程系数（新增逻辑）
-                setQueryProgress(8, `正在获取课程系数 (0/${initialCourses.length})...`, '正在读取每门课的成绩项配置。');
-                const coefficientMap = new Map();
-                
-                // 分批并发获取系数
-                const batchSize = 5;
-                for (let i = 0; i < initialCourses.length; i += batchSize) {
-                    const batch = initialCourses.slice(i, i + batchSize);
-                    await Promise.all(batch.map(async (course) => {
-                        if (course.JXBID) {
-                            const coeffs = await fetchCourseCoefficients(course.JXBID);
-                            if (coeffs) {
-                                coefficientMap.set(course.JXBID, coeffs);
-                            }
-                        }
-                    }));
-                    const coefficientProgress = 8 + Math.round((Math.min(i + batchSize, initialCourses.length) / initialCourses.length) * 12);
-                    setQueryProgress(coefficientProgress, `正在获取课程系数 (${Math.min(i + batchSize, initialCourses.length)}/${initialCourses.length})...`, '正在读取每门课的成绩项配置。');
-                    await new Promise(r => setTimeout(r, 50)); // 稍微延时防止请求过快
-                }
+                // 2. 使用成绩查询接口分三轮获取平时/期末成绩系数
+                setQueryProgress(8, '正在轮询课程系数（第1/3轮）...', '先查询常见的整十系数。');
+                const coefficientProbeResult = await fetchCourseCoefficientsByPolling(initialCourses, progress => {
+                    const coefficientProgress = Math.min(8 + (progress.completedQueries / progress.maxQueries) * 25, 33);
+                    setQueryProgress(
+                        coefficientProgress,
+                        `正在轮询课程系数（第${progress.roundIndex}/3轮）...`,
+                        `${progress.field}=${progress.value}，已完成 ${progress.completedQueries} 个系数查询。`
+                    );
+                });
+                const coefficientMap = coefficientProbeResult.coefficientMap;
+                setQueryProgress(
+                    35,
+                    `课程系数查询完成：接口命中 ${coefficientProbeResult.resolvedCount}/${initialCourses.length} 门`,
+                    coefficientProbeResult.unresolvedCount > 0
+                        ? `其余 ${coefficientProbeResult.unresolvedCount} 门将在成绩查询后使用数学模型推算。`
+                        : '所有课程均已通过接口轮询获得完整系数。'
+                );
 
                 // 3. 初始化课程Map，并根据系数判断需要查询哪些成绩
                 const courseMap = new Map();
@@ -1112,22 +1110,21 @@
                 let needQmcjCount = 0;  // 需要查询期末成绩的课程数
                 
                 initialCourses.forEach(course => {
-                    const key = course.KCM + course.XNXQDM_DISPLAY;
+                    const key = getCourseIdentity(course);
                     
                     // 初始化成绩
                     course.PSCJ = 'N/A';
                     course.QMCJ = 'N/A';
                     
-                    // 检查是否获取到了官方系数
-                    const officialCoeffs = coefficientMap.get(course.JXBID);
+                    // 检查是否通过分层轮询获取到了完整系数
+                    const queriedCoeffs = coefficientMap.get(String(course.JXBID || '').trim());
                     
-                    if (officialCoeffs) {
-                        // 使用官方系数
-                        course.PSCJXS = officialCoeffs.pscjxs;
-                        course.QMCJXS = officialCoeffs.qmcjxs;
-                        course._pscjxsNum = parseFloat(officialCoeffs.pscjxs);
-                        course._qmcjxsNum = parseFloat(officialCoeffs.qmcjxs);
-                        course._coefficientsSource = 'official'; // 标记来源
+                    if (queriedCoeffs) {
+                        course.PSCJXS = String(queriedCoeffs.pscjxs);
+                        course.QMCJXS = String(queriedCoeffs.qmcjxs);
+                        course._pscjxsNum = queriedCoeffs.pscjxs;
+                        course._qmcjxsNum = queriedCoeffs.qmcjxs;
+                        course._coefficientsSource = 'polling';
                         course._coefficientsInferred = false;
                         
                         // 根据系数优化查询需求
@@ -1138,7 +1135,7 @@
                         if (!course._needPscj) course.PSCJ = '-';
                         if (!course._needQmcj) course.QMCJ = '-';
                         
-                        console.log(`[系数获取] ${course.KCM}: 使用接口系数 平时${course.PSCJXS}% 期末${course.QMCJXS}%`);
+                        console.log(`[系数轮询] ${course.KCM}: 平时${course.PSCJXS}% 期末${course.QMCJXS}%`);
                     } else {
                         // 未获取到系数，准备推算
                         course.PSCJXS = '?';  // '?' 表示待计算
@@ -1165,9 +1162,9 @@
                 let pscjFoundCount = 0;
                 let qmcjFoundCount = 0;
                 
-                setQueryProgress(20, '正在查询详细成绩...', '正在并行扫描平时成绩和期末成绩。');
+                setQueryProgress(35, '正在查询详细成绩...', '正在并行扫描平时成绩和期末成绩。');
 
-                // 3. 十线程并行分段查询策略
+                // 4. 十线程并行分段查询策略
                 // 10个线程分别处理10个分数段，每个线程处理约10个分数
                 const scoreRanges = [
                     { start: 100, end: 91, label: '分段91-100' },
@@ -1194,7 +1191,7 @@
                 const updateProgress = () => {
                     const totalScores = 101;
                     const scanProgress = Math.min((sharedState.queriedScores.size / totalScores) * 100, 100);
-                    const progress = Math.min(20 + scanProgress * 0.78, 98);
+                    const progress = Math.min(35 + scanProgress * 0.63, 98);
                     setQueryProgress(
                         progress,
                         `并行查询中... [平时:${sharedState.pscjFoundCount}/${needPscjCount} 期末:${sharedState.qmcjFoundCount}/${needQmcjCount}] (已查${sharedState.queriedScores.size}个分数)`,
@@ -1213,8 +1210,8 @@
                 
                 // 尝试推算课程系数的函数（支持0:100情况）
                 const tryInferCourseCoefficients = (course, scoreType, score) => {
-                    // 如果已经是官方系数或已经推算过，则跳过
-                    if (course._coefficientsSource === 'official' || course._coefficientsInferred) {
+                    // 如果已经通过接口轮询获得系数或已经推算过，则跳过
+                    if (course._coefficientsSource === 'polling' || course._coefficientsInferred) {
                         return;
                     }
                     
@@ -1316,7 +1313,7 @@
                             try {
                                 const pscjRows = await performQuery(score, 'PSCJ');
                                 pscjRows.forEach(row => {
-                                    const key = row.KCM + row.XNXQDM_DISPLAY;
+                                    const key = getCourseIdentity(row);
                                     const course = courseMap.get(key);
                                     if (course && course.PSCJ === 'N/A' && course._needPscj) {
                                         course.PSCJ = score.toString();
@@ -1335,7 +1332,7 @@
                             try {
                                 const qmcjRows = await performQuery(score, 'QMCJ');
                                 qmcjRows.forEach(row => {
-                                    const key = row.KCM + row.XNXQDM_DISPLAY;
+                                    const key = getCourseIdentity(row);
                                     const course = courseMap.get(key);
                                     if (course && course.QMCJ === 'N/A' && course._needQmcj) {
                                         course.QMCJ = score.toString();
@@ -1405,7 +1402,9 @@
                 const { finalScore, grade } = calculateFinalScoreAndGrade(course);
                 // 判断系数来源
                 let coefficientSource = '未知';
-                if (course._coefficientsSource === 'official') {
+                if (course._coefficientsSource === 'polling') {
+                    coefficientSource = '接口轮询';
+                } else if (course._coefficientsSource === 'official') {
                     coefficientSource = '接口返回';
                 } else if (course._coefficientsInferred) {
                     coefficientSource = '推算';
@@ -1490,6 +1489,14 @@
         const hasQmcj = qmcjStr !== '-' && qmcjStr !== 'N/A' && !isNaN(qmcj);
 
         let rawFinalScore;
+
+        // 两项系数之和不足100时，课程可能还包含期中、实验等成绩项，不能只用平时和期末重算总成绩。
+        if (pscjxsKnown && qmcjxsKnown && pscjxs + qmcjxs !== 100) {
+            if (course.ZCJ != null) {
+                return { finalScore: course.ZCJ, grade: course.DJCJMC || 'N/A' };
+            }
+            return { finalScore: 'N/A', grade: 'N/A' };
+        }
 
         // 情况1：系数都未知，无法计算，使用服务器返回的总成绩
         if (!pscjxsKnown && !qmcjxsKnown) {
@@ -4151,43 +4158,161 @@
         });
     }
 
-    // 获取单门课程的系数
-    function fetchCourseCoefficients(jxbid) {
-        return new Promise(resolve => {
-            const url = `${location.origin}/jwapp/sys/cjcx/modules/cjcx/jxblrcjxs.do`;
-            GM_xmlhttpRequest({
-                method: "POST",
-                url: url,
-                headers: {
-                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "X-Requested-With": "XMLHttpRequest"
-                },
-                data: `JXBID=${jxbid}&XSYC=0`,
-                timeout: 5000, // 系数查询超时时间短一点
-                onload: res => {
-                    try {
-                        if (res.status === 200) {
-                            const data = JSON.parse(res.responseText);
-                            // 结构: datas.jxblrcjxs.rows[0]
-                            const row = data?.datas?.jxblrcjxs?.rows?.[0];
-                            if (row) {
-                                resolve({
-                                    pscjxs: row.PSCJXS,
-                                    qmcjxs: row.QMCJXS
-                                });
-                                return;
-                            }
-                        }
-                    } catch (e) {
-                        console.error(`[深大成绩查询] 获取课程系数失败 JXBID=${jxbid}`, e);
-                    }
-                    resolve(null);
-                },
-                onerror: () => resolve(null),
-                ontimeout: () => resolve(null)
+    function getCourseIdentity(course) {
+        const jxbid = String(course?.JXBID || '').trim();
+        if (jxbid) return `JXBID:${jxbid}`;
+
+        const courseName = String(course?.KCM || '').trim();
+        const semester = String(course?.XNXQDM_DISPLAY || course?.XNXQDM || '').trim();
+        return `COURSE:${courseName}|${semester}`;
+    }
+
+    async function fetchCourseCoefficientsByPolling(courses, onProgress) {
+        const courseIds = new Set(
+            courses
+                .map(course => String(course?.JXBID || '').trim())
+                .filter(Boolean)
+        );
+        const coefficientMap = new Map();
+
+        if (courseIds.size === 0) {
+            return {
+                coefficientMap,
+                resolvedCount: 0,
+                unresolvedCount: courses.length
+            };
+        }
+
+        const rounds = [
+            {
+                name: '整十系数',
+                values: Array.from({ length: 11 }, (_, index) => index * 10)
+            },
+            {
+                name: '五分位系数',
+                values: Array.from({ length: 10 }, (_, index) => index * 10 + 5)
+            },
+            {
+                name: '剩余整数系数',
+                values: Array.from({ length: 101 }, (_, index) => index).filter(value => value % 5 !== 0)
+            }
+        ];
+        const fields = ['PSCJXS', 'QMCJXS'];
+        const fieldMatches = new Map(fields.map(field => [field, new Map()]));
+        const maxQueries = rounds.reduce((total, round) => total + round.values.length * fields.length, 0);
+        let completedQueries = 0;
+
+        for (let roundIndex = 0; roundIndex < rounds.length; roundIndex++) {
+            const round = rounds[roundIndex];
+            const unresolvedFields = fields.filter(field => {
+                return getUniqueCoefficientMatches(courseIds, fieldMatches.get(field)).size < courseIds.size;
+            });
+
+            if (unresolvedFields.length === 0) break;
+
+            const tasks = unresolvedFields.flatMap(field => {
+                return round.values.map(value => ({ field, value }));
+            });
+
+            await runTasksWithConcurrency(tasks, 6, async task => {
+                const rows = await performQuery(task.value, task.field);
+                collectCoefficientMatches(courseIds, fieldMatches.get(task.field), rows, task.value);
+                completedQueries++;
+
+                if (typeof onProgress === 'function') {
+                    onProgress({
+                        roundIndex: roundIndex + 1,
+                        roundName: round.name,
+                        field: task.field,
+                        value: task.value,
+                        completedQueries,
+                        maxQueries
+                    });
+                }
+
+                await sleep(20);
+            });
+
+            const pscjxsResolved = getUniqueCoefficientMatches(courseIds, fieldMatches.get('PSCJXS')).size;
+            const qmcjxsResolved = getUniqueCoefficientMatches(courseIds, fieldMatches.get('QMCJXS')).size;
+            console.log(
+                `[系数轮询] 第${roundIndex + 1}/3轮（${round.name}）完成：` +
+                `平时系数 ${pscjxsResolved}/${courseIds.size}，期末系数 ${qmcjxsResolved}/${courseIds.size}`
+            );
+        }
+
+        const pscjxsValues = getUniqueCoefficientMatches(courseIds, fieldMatches.get('PSCJXS'));
+        const qmcjxsValues = getUniqueCoefficientMatches(courseIds, fieldMatches.get('QMCJXS'));
+
+        courseIds.forEach(jxbid => {
+            if (!pscjxsValues.has(jxbid) || !qmcjxsValues.has(jxbid)) return;
+
+            coefficientMap.set(jxbid, {
+                pscjxs: pscjxsValues.get(jxbid),
+                qmcjxs: qmcjxsValues.get(jxbid)
             });
         });
+
+        const ambiguousPscjxs = countAmbiguousCoefficientMatches(courseIds, fieldMatches.get('PSCJXS'));
+        const ambiguousQmcjxs = countAmbiguousCoefficientMatches(courseIds, fieldMatches.get('QMCJXS'));
+        if (ambiguousPscjxs > 0 || ambiguousQmcjxs > 0) {
+            console.warn(
+                `[系数轮询] 检测到重复命中：平时系数 ${ambiguousPscjxs} 门，期末系数 ${ambiguousQmcjxs} 门；` +
+                '这些课程将回退到数学模型。'
+            );
+        }
+
+        return {
+            coefficientMap,
+            resolvedCount: coefficientMap.size,
+            unresolvedCount: Math.max(courses.length - coefficientMap.size, 0)
+        };
+    }
+
+    function collectCoefficientMatches(courseIds, matchMap, rows, value) {
+        rows.forEach(row => {
+            const jxbid = String(row?.JXBID || '').trim();
+            if (!jxbid || !courseIds.has(jxbid)) return;
+
+            if (!matchMap.has(jxbid)) {
+                matchMap.set(jxbid, new Set());
+            }
+            matchMap.get(jxbid).add(value);
+        });
+    }
+
+    function getUniqueCoefficientMatches(courseIds, matchMap) {
+        const uniqueMatches = new Map();
+
+        courseIds.forEach(jxbid => {
+            const values = matchMap.get(jxbid);
+            if (values?.size === 1) {
+                uniqueMatches.set(jxbid, Array.from(values)[0]);
+            }
+        });
+
+        return uniqueMatches;
+    }
+
+    function countAmbiguousCoefficientMatches(courseIds, matchMap) {
+        let count = 0;
+        courseIds.forEach(jxbid => {
+            if ((matchMap.get(jxbid)?.size || 0) > 1) count++;
+        });
+        return count;
+    }
+
+    async function runTasksWithConcurrency(tasks, concurrency, worker) {
+        let nextIndex = 0;
+        const workerCount = Math.min(Math.max(concurrency, 1), tasks.length);
+        const workers = Array.from({ length: workerCount }, async () => {
+            while (nextIndex < tasks.length) {
+                const currentIndex = nextIndex++;
+                await worker(tasks[currentIndex]);
+            }
+        });
+
+        await Promise.all(workers);
     }
 
     // 执行成绩查询
