@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         深圳大学平时成绩&期末成绩查询
 // @namespace    http://tampermonkey.net/
-// @version      4.20
+// @version      4.22
 // @description  支持成绩与系数分层轮询、数学模型回退及页面内表格展示
 // @author       流年.
 // @match        https://ehall.szu.edu.cn/jwapp/sys/cjcx/*
@@ -280,11 +280,95 @@
             width: 100%;
             box-sizing: border-box;
             min-width: 0;
+            overflow: hidden;
+            background: #fff;
+            border: 1px solid #d9e2ea;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(38, 50, 56, 0.06);
+        }
+        .score-chart-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 38px;
+            padding: 0 14px;
+            color: #455a64;
+            border-bottom: 1px solid #edf1f4;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .score-chart-swatch {
+            width: 9px;
+            height: 9px;
+            flex: 0 0 auto;
+            border-radius: 50%;
+            background: var(--score-chart-color);
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--score-chart-color) 16%, transparent);
         }
         .score-chart-card svg {
             width: 100%;
             height: auto;
             display: block;
+            background: #fff;
+        }
+        .score-chart-grid-line,
+        .score-chart-axis-label,
+        .score-chart-area,
+        .score-chart-line,
+        .score-chart-point,
+        .score-chart-guide,
+        .score-chart-tooltip {
+            transition: opacity 0.2s ease, filter 0.2s ease;
+        }
+        .score-chart-point {
+            cursor: crosshair;
+        }
+        .score-chart-point:focus {
+            outline: none;
+        }
+        .score-chart-point-hit {
+            fill: transparent;
+            stroke: transparent;
+            pointer-events: all;
+        }
+        .score-chart-marker {
+            transform-box: fill-box;
+            transform-origin: center;
+            transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), fill 0.2s ease, filter 0.2s ease;
+        }
+        .score-chart-guide,
+        .score-chart-tooltip {
+            opacity: 0;
+            pointer-events: none;
+        }
+        .score-chart-point:hover .score-chart-marker,
+        .score-chart-point:focus .score-chart-marker {
+            transform: scale(1.45);
+            filter: drop-shadow(0 2px 3px rgba(38, 50, 56, 0.22));
+        }
+        .score-chart-point:hover .score-chart-guide,
+        .score-chart-point:focus .score-chart-guide,
+        .score-chart-point:hover .score-chart-tooltip,
+        .score-chart-point:focus .score-chart-tooltip {
+            opacity: 1;
+        }
+        .score-chart-card:has(.score-chart-point:hover) .score-chart-area,
+        .score-chart-card:has(.score-chart-point:focus) .score-chart-area {
+            opacity: 0.04;
+        }
+        .score-chart-card:has(.score-chart-point:hover) .score-chart-line,
+        .score-chart-card:has(.score-chart-point:focus) .score-chart-line {
+            opacity: 0.2;
+        }
+        .score-chart-card:has(.score-chart-point:hover) .score-chart-point:not(:hover),
+        .score-chart-card:has(.score-chart-point:focus) .score-chart-point:not(:focus) {
+            opacity: 0.16;
+        }
+        .score-chart-card:has(.score-chart-point:hover) .score-chart-grid-line,
+        .score-chart-card:has(.score-chart-point:focus) .score-chart-grid-line,
+        .score-chart-card:has(.score-chart-point:hover) .score-chart-axis-label,
+        .score-chart-card:has(.score-chart-point:focus) .score-chart-axis-label {
+            opacity: 0.45;
         }
         #score-query-container .score-chart-grid {
             grid-template-columns: 1fr;
@@ -400,9 +484,13 @@
             word-break: break-word;
             overflow-wrap: anywhere;
         }
-        .score-table .score-number {
+        .score-table .score-total {
             font-weight: 700;
             color: #d81b60;
+        }
+        .score-table .score-detail {
+            font-weight: 700;
+            color: #00796b;
         }
         .score-table .score-muted {
             color: #8a8a8a;
@@ -1605,9 +1693,9 @@
             return ''; // 数据点太少，不显示图表
         }
 
-        const chartWidth = 440;
-        const chartHeight = 120;
-        const padding = { top: 20, right: 30, bottom: 30, left: 35 };
+        const chartWidth = 520;
+        const chartHeight = 166;
+        const padding = { top: 30, right: 38, bottom: 38, left: 44 };
         const innerWidth = chartWidth - padding.left - padding.right;
         const innerHeight = chartHeight - padding.top - padding.bottom;
 
@@ -1616,8 +1704,13 @@
             if (data.length < 2) return '';
             
             const gpas = data.map(d => d.gpa);
-            const minGPA = Math.max(0, Math.floor(Math.min(...gpas) * 10) / 10 - 0.2);
-            const maxGPA = Math.min(5, Math.ceil(Math.max(...gpas) * 10) / 10 + 0.2);
+            let minGPA = Math.max(0, Math.floor(Math.min(...gpas) * 10) / 10 - 0.2);
+            let maxGPA = Math.min(5, Math.ceil(Math.max(...gpas) * 10) / 10 + 0.2);
+            if (maxGPA - minGPA < 0.6) {
+                const middle = (maxGPA + minGPA) / 2;
+                minGPA = Math.max(0, middle - 0.3);
+                maxGPA = Math.min(5, middle + 0.3);
+            }
             const gpaRange = maxGPA - minGPA || 1;
 
             // 计算点的位置
@@ -1642,30 +1735,57 @@
                 yTicks.push({ val: val.toFixed(1), y });
             }
 
+            const labelStep = Math.max(1, Math.ceil(points.length / 5));
+            const tooltipWidth = 138;
+            const tooltipHeight = 40;
+            const safeTitle = escapeHtml(title);
+
             return `
-                <div class="score-chart-card">
-                    <div style="font-size:0.8rem;color:#666;margin-bottom:4px;font-weight:500;">${title}</div>
-                    <svg width="${chartWidth}" height="${chartHeight}" viewBox="0 0 ${chartWidth} ${chartHeight}" style="background:#fff;border-radius:6px;border:1px solid #e0e0e0;">
+                <div class="score-chart-card" style="--score-chart-color:${color};">
+                    <div class="score-chart-title">
+                        <span class="score-chart-swatch" aria-hidden="true"></span>
+                        <span>${safeTitle}</span>
+                    </div>
+                    <svg class="score-chart-canvas" width="${chartWidth}" height="${chartHeight}" viewBox="0 0 ${chartWidth} ${chartHeight}" role="img" aria-label="${safeTitle}">
                         <!-- 网格线 -->
-                        ${yTicks.map(t => `<line x1="${padding.left}" y1="${t.y}" x2="${chartWidth - padding.right}" y2="${t.y}" stroke="#f0f0f0" stroke-width="1"/>`).join('')}
+                        ${yTicks.map(t => `<line class="score-chart-grid-line" x1="${padding.left}" y1="${t.y}" x2="${chartWidth - padding.right}" y2="${t.y}" stroke="#e8edf1" stroke-width="1"/>`).join('')}
                         
                         <!-- Y轴刻度值 -->
-                        ${yTicks.map(t => `<text x="${padding.left - 5}" y="${t.y + 3}" text-anchor="end" font-size="10" fill="#999">${t.val}</text>`).join('')}
-                        
-                        <!-- X轴标签 -->
-                        ${points.map((p, i) => `<text x="${p.x}" y="${chartHeight - 8}" text-anchor="middle" font-size="9" fill="#666">${p.label}</text>`).join('')}
+                        ${yTicks.map(t => `<text class="score-chart-axis-label" x="${padding.left - 8}" y="${t.y + 4}" text-anchor="end" font-size="10" fill="#90a4ae">${t.val}</text>`).join('')}
                         
                         <!-- 填充区域 -->
-                        <path d="${areaPath}" fill="${color}" fill-opacity="0.1"/>
+                        <path class="score-chart-area" d="${areaPath}" fill="${color}" fill-opacity="0.1"/>
                         
                         <!-- 折线 -->
-                        <path d="${linePath}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path class="score-chart-line" d="${linePath}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
                         
                         <!-- 数据点 -->
-                        ${points.map(p => `
-                            <circle cx="${p.x}" cy="${p.y}" r="4" fill="#fff" stroke="${color}" stroke-width="2"/>
-                            <text x="${p.x}" y="${p.y - 8}" text-anchor="middle" font-size="10" font-weight="bold" fill="${color}">${p.gpa.toFixed(2)}</text>
-                        `).join('')}
+                        ${points.map((p, index) => {
+                            const label = String(p.label || '未知');
+                            const shortLabel = label.length > 18 ? `${label.slice(0, 17)}...` : label;
+                            const tooltipX = Math.max(4, Math.min(chartWidth - tooltipWidth - 4, p.x - tooltipWidth / 2));
+                            const tooltipY = p.y < padding.top + 48
+                                ? p.y + 14
+                                : p.y - tooltipHeight - 14;
+                            const showAxisLabel = index % labelStep === 0 || index === points.length - 1;
+                            const showValueLabel = points.length <= 6 || index === 0 || index === points.length - 1;
+                            const ariaLabel = escapeHtml(`${label}，GPA ${p.gpa.toFixed(2)}`);
+
+                            return `
+                                <g class="score-chart-point" tabindex="0" role="img" aria-label="${ariaLabel}">
+                                    <line class="score-chart-guide" x1="${p.x}" y1="${padding.top}" x2="${p.x}" y2="${padding.top + innerHeight}" stroke="${color}" stroke-width="1" stroke-dasharray="3 3"/>
+                                    <circle class="score-chart-point-hit" cx="${p.x}" cy="${p.y}" r="13"/>
+                                    <circle class="score-chart-marker" cx="${p.x}" cy="${p.y}" r="4.5" fill="#fff" stroke="${color}" stroke-width="2.5"/>
+                                    ${showValueLabel ? `<text x="${p.x}" y="${p.y - 11}" text-anchor="middle" font-size="10.5" font-weight="700" fill="${color}">${p.gpa.toFixed(2)}</text>` : ''}
+                                    ${showAxisLabel ? `<text x="${p.x}" y="${chartHeight - 12}" text-anchor="middle" font-size="9.5" fill="#607d8b">${escapeHtml(label)}</text>` : ''}
+                                    <g class="score-chart-tooltip" transform="translate(${tooltipX} ${tooltipY})">
+                                        <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="6" fill="#263238" fill-opacity="0.94"/>
+                                        <text x="10" y="16" font-size="9.5" font-weight="600" fill="#eceff1">${escapeHtml(shortLabel)}</text>
+                                        <text x="10" y="31" font-size="11" font-weight="700" fill="#fff">GPA ${p.gpa.toFixed(2)}</text>
+                                    </g>
+                                </g>
+                            `;
+                        }).join('')}
                     </svg>
                 </div>
             `;
@@ -1675,13 +1795,13 @@
         
         // 学期 GPA 趋势
         if (semesterData.length >= 2) {
-            html += generateLineChart(semesterData, '#1976d2', '📈 学期 GPA 趋势');
+            html += generateLineChart(semesterData, '#1976d2', '学期 GPA 趋势');
         }
         
         // 学年 GPA 趋势
         if (yearData.length >= 2) {
             const yearChartData = yearData.slice().reverse().map(d => ({ label: d.year, gpa: parseFloat(d.gpa) }));
-            html += generateLineChart(yearChartData, '#43a047', '📊 学年 GPA 趋势');
+            html += generateLineChart(yearChartData, '#43a047', '学年 GPA 趋势');
         }
         
         html += '</div>';
@@ -2045,10 +2165,10 @@
             appendTableCell(tr, normalizeDisplayValue(course.KCM), 'td', 'course-name-cell');
             appendTableCell(tr, formatCourseNature(course), 'td');
             appendTableCell(tr, normalizeDisplayValue(course.XF), 'td');
-            appendTableCell(tr, normalizeDisplayValue(finalScore), 'td', 'score-number');
+            appendTableCell(tr, normalizeDisplayValue(finalScore), 'td', scoreCellClass(finalScore, 'score-total'));
             appendTableCell(tr, normalizeDisplayValue(course.DJCJMC || grade), 'td');
-            appendTableCell(tr, formatScoreDisplay(course.PSCJ), 'td', scoreCellClass(course.PSCJ));
-            appendTableCell(tr, formatScoreDisplay(course.QMCJ), 'td', scoreCellClass(course.QMCJ));
+            appendTableCell(tr, formatScoreDisplay(course.PSCJ), 'td', scoreCellClass(course.PSCJ, 'score-detail'));
+            appendTableCell(tr, formatScoreDisplay(course.QMCJ), 'td', scoreCellClass(course.QMCJ, 'score-detail'));
             appendTableCell(tr, formatCoefficient(course.PSCJXS), 'td', 'score-coeff');
             appendTableCell(tr, formatCoefficient(course.QMCJXS), 'td', 'score-coeff');
 
@@ -2077,8 +2197,14 @@
         return normalizeDisplayValue(value);
     }
 
-    function scoreCellClass(value) {
-        return value === 'N/A' || value === '?' || value === null || value === undefined ? 'score-muted' : 'score-number';
+    function scoreCellClass(value, scoreClass) {
+        const isMissing = value === 'N/A'
+            || value === '?'
+            || value === '-'
+            || value === ''
+            || value === null
+            || value === undefined;
+        return isMissing ? 'score-muted' : scoreClass;
     }
 
     function formatCourseNature(course) {
