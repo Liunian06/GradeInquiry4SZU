@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         深圳大学平时成绩&期末成绩查询
 // @namespace    http://tampermonkey.net/
-// @version      4.22
-// @description  支持成绩与系数分层轮询、数学模型回退及页面内表格展示
+// @version      4.23
+// @description  支持成绩与系数查询、学期/学年绩点排名及页面内表格展示
 // @author       流年.
 // @match        https://ehall.szu.edu.cn/jwapp/sys/cjcx/*
 // @match        https://ehall-443.webvpn.szu.edu.cn/jwapp/sys/cjcx/*
@@ -25,6 +25,11 @@
         container: null,
         studentId: null,
         studentName: null,
+        rankData: {
+            status: 'idle',
+            bySemester: {},
+            error: null
+        },
         devMode: false,
         isProbing: false,
         queryProgress: {
@@ -271,6 +276,20 @@
             text-align: right;
             font-variant-numeric: tabular-nums;
         }
+        .score-rank-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(280px, 1fr));
+            gap: 14px;
+            margin-top: 14px;
+        }
+        .score-rank-chart-empty {
+            min-height: 166px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #90a4ae;
+            font-size: 0.82rem;
+        }
         .score-chart-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(280px, 1fr));
@@ -374,6 +393,10 @@
             grid-template-columns: 1fr;
             gap: 10px;
         }
+        #score-query-container .score-rank-grid {
+            grid-template-columns: 1fr;
+            gap: 10px;
+        }
         .score-semester-section {
             margin-bottom: 18px;
         }
@@ -426,7 +449,8 @@
         .score-table col.score-col-final-coeff { width: 156px; }
         @media (max-width: 900px) {
             .score-summary-grid,
-            .score-chart-grid {
+            .score-chart-grid,
+            .score-rank-grid {
                 grid-template-columns: 1fr;
             }
         }
@@ -1156,6 +1180,11 @@
             startBtn.disabled = true;
             exportBtn.disabled = true;
             scriptState.courseData = [];
+            scriptState.rankData = {
+                status: 'idle',
+                bySemester: {},
+                error: null
+            };
             resultsEl.innerHTML = '';
             renderInlineScorePanel();
             progressEl.style.width = '0%';
@@ -1172,6 +1201,12 @@
                     setQueryProgress(100, '未找到任何课程记录，请确认当前学期有成绩。', '', false);
                     return;
                 }
+
+                if (!scriptState.studentId) {
+                    scriptState.studentId = String(initialCourses.find(course => course?.XH)?.XH || '').trim() || null;
+                }
+                const rankSemesterCodes = [...new Set(initialCourses.map(course => String(course?.XNXQDM || '').trim()).filter(Boolean))];
+                const rankQueryPromise = fetchGpaRankData(scriptState.studentId, rankSemesterCodes);
 
                 // 2. 使用成绩查询接口分三轮获取平时/期末成绩系数
                 setQueryProgress(8, '正在轮询课程系数（第1/3轮）...', '先查询常见的整十系数。');
@@ -1452,6 +1487,9 @@
                 // 启动10个并行线程
                 console.log('[深大成绩查询] 启动10线程并行查询...');
                 await Promise.all(scoreRanges.map(range => queryRangeTask(range)));
+
+                // 排名接口失败不影响成绩主流程，但完成前等待其落盘并刷新两张排名表。
+                await rankQueryPromise;
                 
                 // 更新最终计数
                 pscjFoundCount = sharedState.pscjFoundCount;
@@ -1867,6 +1905,7 @@
         );
         summaryHTML += '</div>';
         summaryHTML += renderGPAChart(semesterGPAData, yearGPAs);
+        summaryHTML += renderRankTrendCharts(semesterGPAData, yearGPAs);
         summaryDiv.innerHTML = summaryHTML;
         container.appendChild(summaryDiv);
     }
@@ -1889,6 +1928,134 @@
                 </table>
             </div>
         `;
+    }
+
+    function renderRankTrendCharts(semesterGPAData, yearGPAs) {
+        const bySemester = scriptState.rankData?.bySemester || {};
+        const semesterRows = semesterGPAData.map(item => ({
+            label: item.label,
+            rank: bySemester[item.key]?.term || null
+        })).filter(item => item.rank?.relativeRank !== null && item.rank?.relativeRank !== undefined);
+        const yearRows = yearGPAs.slice().reverse().map(item => {
+            const semesterCodes = Object.keys(bySemester)
+                .filter(code => code.startsWith(item.year))
+                .sort()
+                .reverse();
+            const latestRank = semesterCodes
+                .map(code => bySemester[code]?.year || null)
+                .find(Boolean) || null;
+            return {
+                label: `${item.year}学年`,
+                rank: latestRank
+            };
+        }).filter(item => item.rank?.relativeRank !== null && item.rank?.relativeRank !== undefined);
+
+        return `
+            <div class="score-rank-grid">
+                ${buildRelativeRankChart('学期排名趋势', semesterRows, '#d81b60')}
+                ${buildRelativeRankChart('学年排名趋势', yearRows, '#00897b')}
+            </div>
+        `;
+    }
+
+    function buildRelativeRankChart(title, rows, color) {
+        const status = scriptState.rankData?.status || 'idle';
+        const safeTitle = escapeHtml(title);
+        if (status === 'loading' || rows.length === 0) {
+            return `
+                <div class="score-chart-card" style="--score-chart-color:${color};">
+                    <div class="score-chart-title">
+                        <span class="score-chart-swatch" aria-hidden="true"></span>
+                        <span>${safeTitle}</span>
+                    </div>
+                    <div class="score-rank-chart-empty">${status === 'loading' ? '正在获取排名...' : '暂无排名数据'}</div>
+                </div>
+            `;
+        }
+
+        const chartWidth = 520;
+        const chartHeight = 182;
+        const padding = { top: 32, right: 38, bottom: 40, left: 50 };
+        const innerWidth = chartWidth - padding.left - padding.right;
+        const innerHeight = chartHeight - padding.top - padding.bottom;
+        const values = rows.map(item => Number(item.rank.relativeRank));
+        let minValue = Math.max(0, Math.floor(Math.min(...values) / 5) * 5 - 5);
+        let maxValue = Math.min(100, Math.ceil(Math.max(...values) / 5) * 5 + 5);
+        if (maxValue - minValue < 10) {
+            const middle = (minValue + maxValue) / 2;
+            minValue = Math.max(0, middle - 5);
+            maxValue = Math.min(100, middle + 5);
+        }
+        const valueRange = maxValue - minValue || 10;
+        const xForIndex = (index) => rows.length === 1
+            ? padding.left + innerWidth / 2
+            : padding.left + (index / (rows.length - 1)) * innerWidth;
+        const points = rows.map((item, index) => ({
+            x: xForIndex(index),
+            // 相对排名数值越小越靠上，与 GPA 趋势图的纵轴方向相反。
+            y: padding.top + ((Number(item.rank.relativeRank) - minValue) / valueRange) * innerHeight,
+            label: item.label,
+            rank: item.rank
+        }));
+        const linePath = points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`).join(' ');
+        const areaPath = `${linePath} L ${points.at(-1).x} ${padding.top + innerHeight} L ${points[0].x} ${padding.top + innerHeight} Z`;
+        const tickCount = 4;
+        const yTicks = Array.from({ length: tickCount + 1 }, (_, index) => ({
+            value: minValue + (valueRange * index / tickCount),
+            y: padding.top + (innerHeight * index / tickCount)
+        }));
+        const labelStep = Math.max(1, Math.ceil(points.length / 5));
+        const tooltipWidth = 164;
+        const tooltipHeight = 54;
+
+        return `
+            <div class="score-chart-card" style="--score-chart-color:${color};">
+                <div class="score-chart-title">
+                    <span class="score-chart-swatch" aria-hidden="true"></span>
+                    <span>${safeTitle}</span>
+                </div>
+                <svg class="score-chart-canvas" width="${chartWidth}" height="${chartHeight}" viewBox="0 0 ${chartWidth} ${chartHeight}" role="img" aria-label="${safeTitle}，数值越小位置越高">
+                    ${yTicks.map(tick => `<line class="score-chart-grid-line" x1="${padding.left}" y1="${tick.y}" x2="${chartWidth - padding.right}" y2="${tick.y}" stroke="#e8edf1" stroke-width="1"/>`).join('')}
+                    ${yTicks.map(tick => `<text class="score-chart-axis-label" x="${padding.left - 8}" y="${tick.y + 4}" text-anchor="end" font-size="10" fill="#90a4ae">${tick.value.toFixed(1)}%</text>`).join('')}
+                    <path class="score-chart-area" d="${areaPath}" fill="${color}" fill-opacity="0.08"/>
+                    <path class="score-chart-line" d="${linePath}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    ${points.map((point, index) => {
+                        const label = String(point.label || '未知');
+                        const shortLabel = label.length > 18 ? `${label.slice(0, 17)}...` : label;
+                        const tooltipX = Math.max(4, Math.min(chartWidth - tooltipWidth - 4, point.x - tooltipWidth / 2));
+                        const tooltipY = point.y < padding.top + 62 ? point.y + 13 : point.y - tooltipHeight - 13;
+                        const showAxisLabel = index % labelStep === 0 || index === points.length - 1;
+                        const relativeRank = formatRelativeRank(point.rank.relativeRank);
+                        const actualRank = formatRankValue(point.rank.rank);
+                        const population = formatRankValue(point.rank.population);
+                        const ariaLabel = escapeHtml(`${label}，相对排名 ${relativeRank}，排名 ${actualRank}，人数 ${population}`);
+                        return `
+                            <g class="score-chart-point" tabindex="0" role="img" aria-label="${ariaLabel}">
+                                <line class="score-chart-guide" x1="${point.x}" y1="${padding.top}" x2="${point.x}" y2="${padding.top + innerHeight}" stroke="${color}" stroke-width="1" stroke-dasharray="3 3"/>
+                                <circle class="score-chart-point-hit" cx="${point.x}" cy="${point.y}" r="13"/>
+                                <circle class="score-chart-marker" cx="${point.x}" cy="${point.y}" r="4.5" fill="#fff" stroke="${color}" stroke-width="2.5"/>
+                                <text x="${point.x}" y="${point.y - 11}" text-anchor="middle" font-size="10.5" font-weight="700" fill="${color}">${escapeHtml(relativeRank)}</text>
+                                ${showAxisLabel ? `<text x="${point.x}" y="${chartHeight - 12}" text-anchor="middle" font-size="9.5" fill="#607d8b">${escapeHtml(label)}</text>` : ''}
+                                <g class="score-chart-tooltip" transform="translate(${tooltipX} ${tooltipY})">
+                                    <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="6" fill="#263238" fill-opacity="0.94"/>
+                                    <text x="10" y="15" font-size="9.5" font-weight="600" fill="#eceff1">${escapeHtml(shortLabel)}</text>
+                                    <text x="10" y="31" font-size="10.5" font-weight="700" fill="#fff">相对排名 ${escapeHtml(relativeRank)}</text>
+                                    <text x="10" y="46" font-size="9.5" fill="#cfd8dc">第 ${escapeHtml(actualRank)} 名 · 共 ${escapeHtml(population)} 人</text>
+                                </g>
+                            </g>
+                        `;
+                    }).join('')}
+                </svg>
+            </div>
+        `;
+    }
+
+    function formatRankValue(value) {
+        return value === null || value === undefined ? '-' : String(value);
+    }
+
+    function formatRelativeRank(value) {
+        return value === null || value === undefined ? '-' : `${value}%`;
     }
 
     function escapeHtml(value) {
@@ -2270,6 +2437,7 @@
         });
         summaryHTML += '</div>';
         summaryHTML += renderGPAChart(semesterGPAData, yearGPAs);
+        summaryHTML += renderRankTrendCharts(semesterGPAData, yearGPAs);
         summaryDiv.innerHTML = summaryHTML;
         resultsEl.appendChild(summaryDiv);
 
@@ -4291,6 +4459,113 @@
         const courseName = String(course?.KCM || '').trim();
         const semester = String(course?.XNXQDM_DISPLAY || course?.XNXQDM || '').trim();
         return `COURSE:${courseName}|${semester}`;
+    }
+
+    async function fetchGpaRankData(studentId, semesterCodes) {
+        const uniqueSemesterCodes = [...new Set((semesterCodes || []).filter(Boolean))].sort();
+        if (!studentId || uniqueSemesterCodes.length === 0) {
+            scriptState.rankData = {
+                status: 'unavailable',
+                bySemester: {},
+                error: !studentId ? '未识别到学号' : '未识别到学期'
+            };
+            renderResults();
+            return scriptState.rankData;
+        }
+
+        scriptState.rankData = {
+            status: 'loading',
+            bySemester: Object.fromEntries(uniqueSemesterCodes.map(code => [code, { term: null, year: null }])),
+            error: null
+        };
+        renderResults();
+
+        const requests = [];
+        uniqueSemesterCodes.forEach(semesterCode => {
+            requests.push({ semesterCode, scope: 'term', typeCode: '02' });
+            requests.push({ semesterCode, scope: 'year', typeCode: '03' });
+        });
+
+        const results = await Promise.all(requests.map(async request => {
+            try {
+                const row = await requestGpaRankRow(studentId, request.semesterCode, request.typeCode);
+                return { ...request, row, error: null };
+            } catch (error) {
+                return { ...request, row: null, error: error instanceof Error ? error.message : String(error) };
+            }
+        }));
+
+        const bySemester = Object.fromEntries(uniqueSemesterCodes.map(code => [code, { term: null, year: null }]));
+        const errors = [];
+        results.forEach(result => {
+            bySemester[result.semesterCode][result.scope] = result.row;
+            if (result.error) errors.push(`${result.semesterCode}/${result.typeCode}: ${result.error}`);
+        });
+        scriptState.rankData = {
+            status: errors.length ? 'partial' : 'loaded',
+            bySemester,
+            error: errors.length ? errors.join('; ') : null
+        };
+        renderResults();
+        return scriptState.rankData;
+    }
+
+    function requestGpaRankRow(studentId, semesterCode, typeCode) {
+        return new Promise((resolve, reject) => {
+            const url = `${location.origin}/jwapp/sys/czjl/modules/czjl/cxxsjdpm.do`;
+            const data = new URLSearchParams({
+                TJXNXQDM: semesterCode,
+                XH: studentId,
+                pageSize: '1',
+                pageNumber: '1',
+                TJLXDM: typeCode,
+                '*order': '-TJSJ'
+            }).toString();
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url,
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                data,
+                timeout: 15000,
+                onload: response => {
+                    if (response.status !== 200) {
+                        reject(new Error(`HTTP ${response.status}`));
+                        return;
+                    }
+                    try {
+                        const payload = JSON.parse(response.responseText || '{}');
+                        const rows = payload?.datas?.cxxsjdpm?.rows;
+                        const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+                        resolve(row ? normalizeGpaRankRow(row) : null);
+                    } catch (error) {
+                        reject(new Error(`响应解析失败: ${error.message}`));
+                    }
+                },
+                onerror: () => reject(new Error('网络请求失败')),
+                ontimeout: () => reject(new Error('请求超时'))
+            });
+        });
+    }
+
+    function normalizeGpaRankRow(row) {
+        return {
+            rank: finiteNumberOrNull(row.PM),
+            relativeRank: finiteNumberOrNull(row.XDPM),
+            population: finiteNumberOrNull(row.CYPMRS),
+            gpa: finiteNumberOrNull(row.GPA),
+            calculatedAt: row.TJSJ || null
+        };
+    }
+
+    function finiteNumberOrNull(value) {
+        if (value === null || value === undefined || value === '') return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
     }
 
     async function fetchCourseCoefficientsByPolling(courses, onProgress) {
